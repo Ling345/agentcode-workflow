@@ -1,0 +1,2126 @@
+"""零依赖网页服务：标准库 http.server + Server-Sent Events。
+
+只监听本机地址，不做鉴权；请勿把它暴露到公网。
+"""
+
+from __future__ import annotations
+
+import ipaddress
+import hmac
+import json
+import os
+import secrets
+import socket
+import threading
+import time
+import uuid
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, quote, urlsplit
+
+from agentcode import agents  # noqa: F401  导入即注册内置智能体
+from agentcode.accounts import Account, AccountStore
+from agentcode.config import (
+    DEFAULT_MAX_SESSIONS,
+    DEFAULT_DAILY_TOKEN_LIMIT,
+    DEFAULT_DB_PATH,
+    Settings,
+)
+from agentcode.core.registry import default_registry
+from agentcode.core.errors import AgentCodeError
+from agentcode.lifecycle import code_root_for
+from agentcode.metrics import HTTP_REQUESTS, HTTP_SECONDS, METRICS, REJECTIONS
+from agentcode.plans import get_plan
+from agentcode.web.auth import build_cookie, clear_cookie, create_token, read_cookie, read_token
+from agentcode.web.limits import (
+    DEFAULT_MAX_CONCURRENT,
+    DEFAULT_PER_MINUTE,
+    UsageGuard,
+)
+from agentcode.web.runs import RunRegistry
+from agentcode.tools import (
+    ToolRegistry,
+    register_builtin_tools,
+    register_code_tools,
+    register_demo_tools,
+)
+from agentcode.tools.code import resolve_in_root
+from agentcode.web.sessions import SessionStore, default_session_dir
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+MAX_BODY_BYTES = 64 * 1024
+#: 单个文件的内容最多返回这么多字符（够看代码，又不至于撑爆前端）
+MAX_FILE_CHARS = 20000
+#: 不需要登录也能访问的路径（登录页本身是静态资源）
+PUBLIC_PATHS = {"/healthz", "/api/login", "/api/me", "/api/logout"}
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8000
+
+_CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".json": "application/json; charset=utf-8",
+}
+
+
+#: 指标里只保留这些路径，其余归到 other——
+#: 否则有人拿随机 URL 扫站就能把标签基数撑爆，把内存吃掉
+METRIC_PATHS = frozenset(
+    {
+        "/",
+        "/healthz",
+        "/metrics",
+        "/api/login",
+        "/api/logout",
+        "/api/me",
+        "/api/agents",
+        "/api/config",
+        "/api/sessions",
+        "/api/session",
+        "/api/sessions/create",
+        "/api/sessions/rename",
+        "/api/sessions/delete",
+        "/api/session/reset",
+        "/api/file",
+        "/api/run",
+        "/api/run/stream",
+        "/api/runs",
+        "/api/plans",
+        "/api/billing",
+        "/api/billing/checkout",
+        "/api/upload",
+    }
+)
+
+
+def metric_path_label(path: str) -> str:
+    """把请求路径收敛成有限的几个取值。"""
+    if path in METRIC_PATHS:
+        return path
+    if path.startswith("/static/"):
+        return "/static"
+    return "other"
+
+
+def is_loopback_host(host: str) -> bool:
+    """这个监听地址是不是只能本机访问。"""
+    text = str(host or "").strip()
+    if text in ("localhost", ""):
+        return True
+    try:
+        return ipaddress.ip_address(text).is_loopback
+    except ValueError:
+        return False
+
+
+def callback_summary(record: dict[str, Any]) -> dict[str, Any]:
+    """回调状态摘要（对外可见）。
+
+    只给主机名，不回显完整地址：回调 URL 的 query 里经常直接放着密钥
+    （``?token=...``），没必要跟着响应到处跑。
+    """
+    url = str(record.get("callback_url") or "")
+    if not url:
+        return {"enabled": False}
+    parts = urlsplit(url)
+    return {
+        "enabled": True,
+        "status": str(record.get("callback_status") or "none"),
+        "host": parts.hostname or "",
+        "attempts": int(record.get("callback_attempts") or 0),
+        "error": str(record.get("callback_error") or ""),
+        "delivered_at": str(record.get("callback_delivered_at") or ""),
+        "next_attempt_at": str(record.get("callback_next_at") or ""),
+    }
+
+
+def safe_upload_name(raw: str) -> str | None:
+    """把上传的文件名清洗成一根"光溜溜"的文件名。
+
+    只取最后一段，`\\` 与 `/` 都当分隔符（Windows 与 Linux 都要挡住），
+    空名字、`.`、`..` 一律拒绝。返回 None 表示这个名字不能用。
+    """
+    name = str(raw or "").replace("\\", "/").split("/")[-1].strip()
+    if not name or name in {".", ".."}:
+        return None
+    return name
+
+
+def directory_size(root: Path) -> int:
+    """目录下所有文件的总字节数（用来算上传配额）。"""
+    if not root.is_dir():
+        return 0
+    total = 0
+    for item in root.rglob("*"):
+        if not item.is_file():
+            continue
+        try:
+            total += item.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def scope_settings_for_plan(settings: Settings, plan_name: str | None) -> Settings:
+    """按套餐收口本次运行的配置。
+
+    现在只收口一件事：套餐不允许执行代码时，把 ``allow_code_tools`` 关掉。
+    注意是**取交集**——全局已经关着的（例如 ``AGENT_ALLOW_CODE_TOOLS=false``），
+    套餐再高也不能把它打开。
+    """
+    if plan_name is None:
+        return settings
+    plan = get_plan(plan_name)
+    if not settings.allow_code_tools or plan.allow_code_tools:
+        return settings
+    return settings.apply_overrides({"allow_code_tools": False})
+
+
+def is_port_open(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, timeout: float = 0.5) -> bool:
+    """探测本机端口是否已经有服务在监听。"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        return sock.connect_ex((host, port)) == 0
+
+
+def _tool_list(mock: bool, settings: Settings | None = None) -> list[dict[str, Any]]:
+    """列出某种模式下的可用工具（只做清单，不创建工作目录）。"""
+    registry = ToolRegistry()
+    active_settings = settings or Settings.from_env()
+    register_builtin_tools(
+        registry,
+        include_search=not mock,
+        serpapi_key=active_settings.serpapi_key,
+    )
+    if mock:
+        register_demo_tools(registry)
+    else:
+        register_code_tools(
+            registry,
+            root=active_settings.code_root,
+            timeout=active_settings.code_timeout,
+            output_limit=active_settings.code_output_limit,
+            create=False,
+        )
+    return [registry.get(name).to_dict() for name in registry.names()]  # type: ignore[union-attr]
+
+
+def agents_payload(settings: Settings | None = None) -> dict[str, Any]:
+    """``GET /api/agents`` 的响应内容。"""
+    return {
+        "agents": [
+            {"name": name, "description": default_registry.description_of(name)}
+            for name in default_registry.names()
+        ],
+        "tools": {"mock": _tool_list(True), "real": _tool_list(False, settings)},
+    }
+
+
+def config_payload(settings: Settings) -> dict[str, Any]:
+    """``GET /api/config`` 的响应内容（密钥已脱敏）。"""
+    masked = settings.masked()
+    missing = settings.missing_keys()
+    return {
+        "model": settings.model,
+        "base_url": settings.base_url,
+        "api_key": masked["LLM_API_KEY"],
+        "serpapi_configured": bool(settings.serpapi_key),
+        "max_steps": settings.max_steps,
+        "coding_steps": settings.coding_steps,
+        "timeout": settings.timeout,
+        "memory_turns": settings.memory_turns,
+        "max_sessions": settings.max_sessions,
+        "code_root": settings.code_root,
+        "env_file": settings.env_file,
+        "missing_keys": missing,
+        "ready": not missing,
+    }
+
+
+class AgentCodeRequestHandler(BaseHTTPRequestHandler):
+    """处理静态页面与接口。"""
+
+    server_version = "AgentCodeWeb/0.1"
+    protocol_version = "HTTP/1.1"
+
+    # ------------------------------------------------------------- 基础设施
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - 覆盖父类签名
+        """默认静音访问日志，``--verbose`` 时打印到标准输出。"""
+        if not getattr(self.server, "quiet", True):
+            super().log_message(format, *args)
+
+    def _begin_request(self) -> None:
+        """记录请求起点与请求 id，供结构化日志使用。"""
+        self._started = time.perf_counter()
+        self._request_id = uuid.uuid4().hex[:8]
+        self._account = self._current_account()
+
+    def _current_account(self) -> Account | None:
+        """从签名 cookie 解析当前账号。"""
+        token = read_cookie(self.headers.get("Cookie"))
+        if not token:
+            return None
+        account_id = read_token(token, self.server.secret_key)  # type: ignore[attr-defined]
+        if not account_id:
+            return None
+        account = self.server.accounts.get_by_id(account_id)  # type: ignore[attr-defined]
+        return account if account and account.is_active else None
+
+    def _log_access(self, status: int) -> None:
+        """记一次请求。
+
+        **指标一定要记**（跟访问日志开关无关），JSON 日志看配置。
+        """
+        elapsed_ms = (
+            time.perf_counter() - getattr(self, "_started", time.perf_counter())
+        ) * 1000
+        bucket = metric_path_label(self.path.split("?", 1)[0])
+        HTTP_REQUESTS.inc(path=bucket, status=str(status))
+        HTTP_SECONDS.observe(elapsed_ms / 1000, path=bucket)
+
+        if not getattr(self.server, "access_log", False):
+            return
+        account = getattr(self, "_account", None)
+        payload = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "request_id": getattr(self, "_request_id", "-"),
+            "method": self.command or "-",
+            "path": self.path.split("?", 1)[0],
+            "status": status,
+            "ms": round(elapsed_ms, 1),
+            "user": account.name if account else "",
+            "ip": self.client_address[0] if self.client_address else "",
+        }
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+    def _store(self) -> SessionStore:
+        """取当前用户的会话仓库——每个用户一个独立目录，天然隔离。"""
+        if not getattr(self.server, "require_auth", True):
+            return self.server.sessions  # type: ignore[attr-defined]
+        account = getattr(self, "_account", None)
+        if account is None:
+            raise PermissionError("未登录")
+        return self.server.store_for(account.id)  # type: ignore[attr-defined]
+
+    def _auth_ok(self) -> bool:
+        """需要登录的接口统一在这里拦：未登录直接回 401 并返回 False。"""
+        if not getattr(self.server, "require_auth", True):
+            return True  # 免登录模式（本地自用）
+        if getattr(self, "_account", None) is not None:
+            return True
+        REJECTIONS.inc(reason="unauthorized")
+        self._send_json({"error": "请先登录。"}, status=401)
+        return False
+
+    def _settings(self) -> Settings:
+        """每次请求都重新读取环境，保证改完 .env 刷新页面即可生效。"""
+        return Settings.from_env(env_file=getattr(self.server, "env_file", None))
+
+    def _audit(
+        self,
+        action: str,
+        *,
+        account: Account | None = None,
+        target: str = "",
+        result: str = "ok",
+        detail: Any = None,
+        actor_name: str = "",
+    ) -> None:
+        """记一条审计：谁、什么时候、对什么、做了什么。
+
+        审计是**旁路**：写失败只打印警告，不影响用户这次操作的结果。
+        """
+        from agentcode.audit import AuditLog
+
+        AuditLog(self.server.accounts).record(  # type: ignore[attr-defined]
+            action,
+            account=account if account is not None else getattr(self, "_account", None),
+            actor_name=actor_name,
+            target=target,
+            result=result,
+            detail=detail,
+            ip=self.client_address[0] if self.client_address else "",
+        )
+
+    def _send(self, status: int, body: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+        self._log_access(status)
+
+    def _send_json(
+        self,
+        payload: dict[str, Any],
+        status: int = 200,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body)
+        self._log_access(status)
+
+    def _client_key(self) -> str:
+        """限流用的 key：已登录用账号名，未登录用 IP。"""
+        account = getattr(self, "_account", None)
+        if account is not None:
+            return f"user:{account.name}"
+        return f"ip:{self.client_address[0] if self.client_address else 'unknown'}"
+
+    def _drain_body(self, limit: int = MAX_BODY_BYTES) -> None:
+        """把请求体读掉。
+
+        在"还没读 body 就要回错误"的路径上必须先调它。不读就回响应的话，
+        客户端还在发数据、服务端已经把连接关了——浏览器拿到的是
+        "连接被中止"而不是真正的状态码，前端连"请先登录"都提示不出来。
+
+        超过 ``limit`` 的请求体不读：那种请求本来就该被拒，被重置也无所谓。
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return
+        if 0 < length <= limit:
+            try:
+                self.rfile.read(length)
+            except OSError:
+                pass
+
+    def _reject_by_limit(self, decision: Any) -> None:
+        """统一的 429 回应。"""
+        reason = "concurrency" if "任务在运行" in str(decision.reason) else "rate_limit"
+        REJECTIONS.inc(reason=reason)
+        headers = {"Retry-After": str(decision.retry_after)} if decision.retry_after else None
+        self._send_json({"error": decision.reason}, status=429, extra_headers=headers)
+
+    # -------------------------------------------------------------- 运行状态
+
+    def _registry(self) -> RunRegistry:
+        """当前服务进程的运行注册表。"""
+        return self.server.registry  # type: ignore[attr-defined]
+
+    def _billing(self) -> Any:
+        """当前服务进程的账单服务（套餐、订单、用量）。"""
+        return self.server.billing  # type: ignore[attr-defined]
+
+    def _notifier(self) -> Any:
+        """通知服务（每次请求现取，配置改了刷新页面就生效）。
+
+        同步发送、不另开线程：渠道超时都卡在 10 秒内，而且通知大多发生在
+        "用户本来就要等一个结果"的时刻（额度用尽、登录失败、注销）。
+        换后台线程的代价是调用方再也说不清"到底发出去没有"，不值。
+        """
+        from agentcode.notify import Notifier
+
+        return Notifier(self.server.accounts, self._settings())  # type: ignore[attr-defined]
+
+    def _handle_upload(self) -> None:
+        """收一个文本文件，存进调用者**自己**的代码工作目录。
+
+        约定（见 docs 里的设计）：只收文本、单文件有上限、每用户目录有总量上限、
+        文件名只取最后一段、同名覆盖。
+
+        走的是"原始 body"而不是 multipart：Python 3.13 已经把 ``cgi`` 删了，
+        而我们要的只是纯文本，原始 body 最省事也最不容易出差错。
+
+        注意顺序：**先把 body 读掉，再判登录**。不读就回 401 的话，客户端还在发
+        数据、服务端已经关连接，浏览器拿到的是"连接被中止"而不是 401——
+        前端就没法提示"请先登录"。这个 bug 在测试里表现为偶发的
+        ConnectionAbortedError（五次里挂两次），很难当成"只是测试不稳定"糊过去。
+        """
+        settings = self._settings()
+
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._send_json({"error": "请求长度不合法。"}, status=400)
+            return
+        if length <= 0:
+            self._send_json({"error": "文件是空的。"}, status=400)
+            return
+        if length > settings.upload_max_bytes:
+            self._drain_body(length)  # 先读完再拒，否则客户端看到的是连接被中止
+            self._send_json(
+                {
+                    "error": f"文件太大（{length} 字节，单个文件上限 "
+                    f"{settings.upload_max_bytes // 1024} KB）。"
+                },
+                status=413,
+            )
+            return
+
+        raw = self.rfile.read(length)
+
+        if not self._auth_ok():
+            return
+        account = getattr(self, "_account", None)
+
+        raw_name = (parse_qs(urlsplit(self.path).query).get("path") or [""])[0]
+        name = safe_upload_name(raw_name)
+        if name is None:
+            self._send_json({"error": "文件名不合法。"}, status=400)
+            return
+
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError:
+            self._send_json({"error": "只支持 UTF-8 编码的文本文件。"}, status=400)
+            return
+        if b"\x00" in raw:
+            self._send_json({"error": "看起来是二进制文件，这里只支持文本。"}, status=400)
+            return
+
+        root = code_root_for(
+            settings.code_root, account.id if account is not None else None
+        )
+        try:
+            target = resolve_in_root(root, name)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+
+        overwritten = target.is_file()
+        if not overwritten:
+            used = directory_size(root)
+            if used + len(raw) > settings.upload_quota_bytes:
+                self._send_json(
+                    {
+                        "error": f"你的工作目录已经用了 {used // 1024} KB，"
+                        f"再传就超过上限 {settings.upload_quota_bytes // 1024} KB 了。"
+                        "先删掉一些文件再传。"
+                    },
+                    status=413,
+                )
+                return
+
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(raw)
+        except OSError as exc:
+            self._send_json({"error": f"写入失败：{exc}"}, status=500)
+            return
+
+        self._send_json(
+            {
+                "path": target.relative_to(root).as_posix(),
+                "bytes": len(raw),
+                "overwritten": overwritten,
+            }
+        )
+
+    def _serve_metrics(self) -> None:
+        """暴露 Prometheus 文本格式的指标。
+
+        绑在回环地址上（本地自用）不要求登录，方便直接 curl；
+        一旦监听到别处就必须登录——指标里带着请求路径、账号名和
+        key 的脱敏指纹，不该对公网敞开。
+
+        容器里必须绑 0.0.0.0，于是"绑回环就免登录"这条走不通，而抓取端
+        又走不了登录流程。所以留一个令牌口子：配了 ``AGENT_METRICS_TOKEN``
+        之后，带对令牌（``Authorization: Bearer xxx`` 或 ``?token=xxx``）就放行。
+        """
+        if not self._metrics_allowed():
+            self._send_json(
+                {"error": "请先登录，或者带上正确的 AGENT_METRICS_TOKEN。"}, status=401
+            )
+            return
+        body = METRICS.render().encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self._log_access(200)
+
+    def _metrics_allowed(self) -> bool:
+        """这个请求能不能看指标。"""
+        if is_loopback_host(getattr(self.server, "bind_host", "127.0.0.1")):
+            return True
+        token = self._settings().metrics_token
+        supplied = self._supplied_metrics_token()
+        if token and supplied and hmac.compare_digest(str(supplied), str(token)):
+            return True
+        return self._auth_ok()
+
+    def _supplied_metrics_token(self) -> str:
+        """从 Authorization 头或查询串里取令牌。"""
+        header = str(self.headers.get("Authorization") or "")
+        if header.lower().startswith("bearer "):
+            return header[7:].strip()
+        return (parse_qs(urlsplit(self.path).query).get("token") or [""])[0]
+
+    def _serve_export(self) -> None:
+        """把自己的会话与代码目录打包成 zip 下载。
+
+        没有导出能力的话，"删除"就是单向门——用户不敢按。
+        """
+        account = getattr(self, "_account", None)
+        if account is None:
+            self._send_json({"error": "请先登录。"}, status=401)
+            return
+        from agentcode.lifecycle import export_archive
+        from agentcode import audit as AUDIT
+
+        blob = export_archive(self._settings(), account.id, account_name=account.name)
+        self._audit(AUDIT.DATA_EXPORT, detail={"bytes": len(blob)})
+        filename = f"agentcode-{account.name}-{time.strftime('%Y%m%d')}.zip"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Length", str(len(blob)))
+        # 用户名可能是中文，走 RFC 5987
+        self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(filename)}")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(blob)
+        self._log_access(200)
+
+    def _purge_code(self) -> None:
+        """清空自己的代码工作目录（含上传的文件）。会话不动。
+
+        清空是**软删除**：整目录搬进回收站，用户后悔了还能拿回来。
+        """
+        account = getattr(self, "_account", None)
+        if account is None:
+            self._send_json({"error": "请先登录。"}, status=401)
+            return
+        from agentcode import audit as AUDIT
+        from agentcode.lifecycle import purge_code
+
+        try:
+            removed = purge_code(self._settings(), account.id)
+        except AgentCodeError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        self._audit(AUDIT.CODE_PURGE, detail={"files": removed})
+        self._send_json({"removed": removed, "recoverable": True})
+
+    def _delete_account(self, payload: dict[str, Any]) -> None:
+        """注销：删账号 + 全部会话 + 全部代码和上传文件。
+
+        要输入自己的用户名才执行——这种事没有"撤销"。
+        """
+        account = getattr(self, "_account", None)
+        if account is None:
+            self._send_json({"error": "请先登录。"}, status=401)
+            return
+        if str(payload.get("confirm") or "").strip() != account.name:
+            self._send_json(
+                {
+                    "error": "请输入你自己的用户名以确认注销（这一步不能撤销）。",
+                    "expected": account.name,
+                },
+                status=400,
+            )
+            return
+
+        from agentcode.lifecycle import delete_account
+        from agentcode import audit as AUDIT
+        from agentcode import notify as NOTIFY
+
+        # 审计要**先记**：账号马上就被删了，记的时候它的名字还在
+        self._audit(AUDIT.ACCOUNT_DELETE, target=account.name)
+        # 最后一条消息：邮箱是删除前抓下来的，删完还能发得出去
+        self._notifier().notify(
+            NOTIFY.EVENT_ACCOUNT_DELETED, account=account, email=account.email or ""
+        )
+        deleted = delete_account(self.server.accounts, self._settings(), account)  # type: ignore[attr-defined]
+        # 内存里缓存的会话仓库也一并丢掉
+        with self.server.store_lock:  # type: ignore[attr-defined]
+            self.server.user_stores.pop(account.id, None)  # type: ignore[attr-defined]
+        self._send_json({"deleted": deleted})
+
+    # ------------------------------------------------------------ 回收站
+
+    def _account_id(self) -> str:
+        """当前账号 id；免登录模式没有账号，返回空串（与共享目录一致）。"""
+        account = getattr(self, "_account", None)
+        return account.id if account is not None else ""
+
+    def _trash_payload(self) -> dict[str, Any]:
+        """回收站里有什么（会话 + 代码目录备份）。"""
+        from agentcode.trash import account_trash
+
+        trash = account_trash(
+            self._settings(), self._account_id(), session_dir=self._store().directory
+        )
+        return {kind: [item.to_dict() for item in items] for kind, items in trash.items()}
+
+    def _serve_trash(self) -> None:
+        if not self._auth_ok():
+            return
+        self._send_json(self._trash_payload())
+
+    def _restore_from_trash(self, payload: dict[str, Any]) -> None:
+        """把回收站里的一条放回去。"""
+        if not self._auth_ok():
+            return
+        from agentcode import audit as AUDIT
+        from agentcode.trash import TrashError, restore_entry
+
+        kind = str(payload.get("kind") or "")
+        entry = str(payload.get("entry") or "")
+        try:
+            report = restore_entry(
+                self._settings(),
+                self._account_id(),
+                kind,
+                entry,
+                session_dir=self._store().directory,
+            )
+        except TrashError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        if kind == "session":
+            # 恢复的是磁盘文件，内存里的仓库要重读一次才看得见
+            self._store().reload()
+        self._audit(AUDIT.TRASH_RESTORE, target=entry, detail={"kind": kind})
+        self._send_json({**report, "trash": self._trash_payload()})
+
+    def _purge_from_trash(self, payload: dict[str, Any]) -> None:
+        """彻底删掉回收站里的一条（没有撤销）。"""
+        if not self._auth_ok():
+            return
+        from agentcode import audit as AUDIT
+        from agentcode.trash import TrashError, purge_entry
+
+        kind = str(payload.get("kind") or "")
+        entry = str(payload.get("entry") or "")
+        try:
+            purged = purge_entry(
+                self._settings(),
+                self._account_id(),
+                kind,
+                entry,
+                session_dir=self._store().directory,
+            )
+        except TrashError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        self._audit(AUDIT.TRASH_PURGE, target=entry, detail={"kind": kind, "purged": purged})
+        self._send_json({"purged": purged, "trash": self._trash_payload()})
+
+    def _empty_trash(self) -> None:
+        """清空回收站。"""
+        if not self._auth_ok():
+            return
+        from agentcode import audit as AUDIT
+        from agentcode.trash import empty_trash
+
+        removed = empty_trash(
+            self._settings(), self._account_id(), session_dir=self._store().directory
+        )
+        self._audit(AUDIT.TRASH_PURGE, target="回收站", detail={"emptied": removed})
+        self._send_json({"removed": removed, "trash": self._trash_payload()})
+
+    # ------------------------------------------------------------ 通知邮箱
+
+    def _serve_email(self) -> None:
+        """看自己填的接收邮箱。"""
+        if not self._auth_ok():
+            return
+        account = getattr(self, "_account", None)
+        self._send_json({"email": (account.email or "") if account else ""})
+
+    def _set_email(self, payload: dict[str, Any]) -> None:
+        """设置或清空接收通知的邮箱（空串 = 清空）。
+
+        只做格式校验，**不做点链接验证**：没有域名和稳定发信能力时，
+        验证链接只会造出一堆点不开的信。这是防手滑，不是防伪造。
+        """
+        if not self._auth_ok():
+            return
+        from agentcode import audit as AUDIT
+        from agentcode.accounts import normalize_email
+        from agentcode.core.errors import AgentCodeError
+
+        account = getattr(self, "_account", None)
+        if account is None:
+            self._send_json({"error": "请先登录。"}, status=401)
+            return
+        try:
+            address = normalize_email(payload.get("email"))
+        except AgentCodeError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        self.server.accounts.set_email(account.name, address)  # type: ignore[attr-defined]
+        self._audit(AUDIT.ACCOUNT_EMAIL, target=address or "（清空）")
+        self._send_json({"email": address})
+
+    def _notify_quota(self, account: Account) -> None:
+        """额度用尽：一天只提醒一次（用户多半是当天最后几次请求撞上的）。"""
+        store: AccountStore = self.server.accounts  # type: ignore[attr-defined]
+        used, _calls = store.usage_today(account.id)
+        self._notifier().quota_exhausted(account, limit=store.daily_limit(account), used=used)
+
+    # ------------------------------------------------------------ API 令牌管理
+
+    def _serve_tokens(self) -> None:
+        """列出自己的 API 令牌（只有前缀，没有明文也没有哈希）。"""
+        if not self._auth_ok():
+            return
+        from agentcode.tokens import ApiTokenService
+
+        account = getattr(self, "_account", None)
+        if account is None:
+            self._send_json({"error": "请先登录。"}, status=401)
+            return
+        self._send_json({"tokens": ApiTokenService(self.server.accounts).list(account.id)})  # type: ignore[attr-defined]
+
+    def _create_token(self, payload: dict[str, Any]) -> None:
+        """新建一把令牌。**明文只在这里返回一次**——之后谁也拿不回来。"""
+        if not self._auth_ok():
+            return
+        from agentcode import audit as AUDIT
+        from agentcode.tokens import ApiTokenService
+
+        account = getattr(self, "_account", None)
+        if account is None:
+            self._send_json({"error": "请先登录。"}, status=401)
+            return
+        raw_days = payload.get("expires_days")
+        expires_days = int(raw_days) if isinstance(raw_days, int) and raw_days > 0 else None
+        record, plaintext = ApiTokenService(self.server.accounts).create(  # type: ignore[attr-defined]
+            account, name=str(payload.get("name") or ""), expires_days=expires_days
+        )
+        self._audit(
+            AUDIT.API_TOKEN_CREATE,
+            target=str(record["name"]),
+            detail={"prefix": record["prefix"], "expires_at": record["expires_at"] or ""},
+        )
+        self._send_json(
+            {
+                "token": plaintext,  # 只此一次
+                "record": {key: value for key, value in record.items() if key != "token_hash"},
+                "warning": "令牌只显示这一次，请立刻复制保存；丢了只能吊销后重建。",
+            }
+        )
+
+    def _revoke_token(self, payload: dict[str, Any]) -> None:
+        """吊销一把令牌（只能吊销自己的）。"""
+        if not self._auth_ok():
+            return
+        from agentcode import audit as AUDIT
+        from agentcode.tokens import ApiTokenService
+
+        account = getattr(self, "_account", None)
+        if account is None:
+            self._send_json({"error": "请先登录。"}, status=401)
+            return
+        token_id = str(payload.get("id") or "").strip()
+        revoked = ApiTokenService(self.server.accounts).revoke(account.id, token_id)  # type: ignore[attr-defined]
+        self._audit(
+            AUDIT.API_TOKEN_REVOKE,
+            target=token_id,
+            result="ok" if revoked else "not_found",
+        )
+        self._send_json({"revoked": revoked})
+
+    # ------------------------------------------------------------ 对外 API
+
+    def _api_gate(self) -> tuple[Account, dict[str, Any]] | None:
+        """对外接口的公共闸门：开关 + 令牌。
+
+        失败时已经回过响应了，调用方直接 ``return`` 即可。
+        """
+        if not self._settings().api_enabled:
+            self._send_json(
+                {"error": "对外 API 已关闭（AGENT_API_ENABLED=false）。"}, status=404
+            )
+            return None
+
+        from agentcode.tokens import ApiTokenService
+
+        header = str(self.headers.get("Authorization") or "")
+        plaintext = header[7:].strip() if header.lower().startswith("bearer ") else ""
+        resolved = ApiTokenService(self.server.accounts).resolve(plaintext)  # type: ignore[attr-defined]
+        if resolved is None:
+            REJECTIONS.inc(reason="bad_token")
+            self._send_json(
+                {
+                    "error": "令牌无效或已失效。请在网页「我的数据」里生成 API 令牌，"
+                    "然后用请求头 Authorization: Bearer <令牌> 调用。",
+                },
+                status=401,
+            )
+            return None
+        return resolved["account"], resolved["token"]
+
+    def _serve_api_me(self) -> None:
+        """GET /v1/me：查自己的套餐、额度、以及这把令牌是谁。"""
+        gate = self._api_gate()
+        if gate is None:
+            return
+        account, token = gate
+        store: AccountStore = self.server.accounts  # type: ignore[attr-defined]
+        plan = store.effective_plan(account)
+        used, calls = store.usage_today(account.id)
+        limit = store.daily_limit(account)
+        unlimited = limit <= 0
+        self._send_json(
+            {
+                "account": account.name,
+                "plan": account.plan,
+                "plan_title": plan.title,
+                "plan_expires_at": account.plan_expires_at or "",
+                "daily_token_limit": limit,
+                "used_today": used,
+                "calls_today": calls,
+                "remaining": -1 if unlimited else max(0, limit - used),
+                "unlimited": unlimited,
+                "limits": {
+                    "per_minute": plan.per_minute,
+                    "max_concurrent": plan.max_concurrent,
+                },
+                "token": {
+                    "name": token["name"],
+                    "prefix": token["prefix"],
+                    "last_used_at": token["last_used_at"],
+                },
+            }
+        )
+
+    def _serve_api_run(self, payload: dict[str, Any]) -> None:
+        """POST /v1/run：给一个任务，同步拿回结果。
+
+        和网页那条路复用同一套东西——agent 装配、中间件、token 预算、限流闸门、
+        用量记账。区别只有两点：认人靠令牌；结果一次性返回而不是流式推送。
+        """
+        from agentcode import audit as AUDIT
+        from agentcode.core.registry import default_registry
+        from agentcode.web.runner import run_stream
+
+        gate = self._api_gate()
+        if gate is None:
+            return
+        account, token = gate
+
+        task = str(payload.get("task") or "").strip()
+        if not task:
+            self._send_json(
+                {"error": '任务不能为空：请求体里要有 {"task": "..."}。'}, status=400
+            )
+            return
+        agent_name = str(payload.get("agent") or "react").strip()
+        if agent_name not in default_registry:
+            self._send_json(
+                {
+                    "error": f"没有这个智能体：{agent_name}。"
+                    f"可用：{'、'.join(default_registry.names())}"
+                },
+                status=400,
+            )
+            return
+
+        raw_steps = payload.get("max_steps")
+        max_steps = int(raw_steps) if isinstance(raw_steps, int) and raw_steps > 0 else None
+        session_id = str(payload.get("session_id") or "").strip() or None
+        wants_async = bool(payload.get("async"))
+        request_key = str(self.headers.get("Idempotency-Key") or "").strip()
+        settings = self._settings()
+
+        accounts: AccountStore = self.server.accounts  # type: ignore[attr-defined]
+        allowed, reason = accounts.check_quota(account)
+        if not allowed:
+            REJECTIONS.inc(reason="quota")
+            self._notify_quota(account)
+            self._send_json({"error": reason}, status=402)
+            return
+
+        # 幂等：同一个键 = 同一单。判断放在限流闸门**之前**——"重发"不该被并发
+        # 限制挡成 429，它就是同一件还没跑完的事。
+        if request_key:
+            existing = accounts.find_api_run_by_key(account.id, request_key)
+            if existing is not None:
+                self._replay_api_run(existing)
+                return
+
+        # 任务完成回调：地址先查一遍再收单。收单之后才发现打不出去，等于
+        # 答应了用户一件做不到的事——还白扣了额度。（幂等重发走上面的分支，
+        # 不会被这里再查一次：那一单早就收下了。）
+        callback_url = self._validated_callback_url(payload, settings, wants_async=wants_async)
+        if callback_url is None:
+            return  # 已经回过 400 了
+
+        plan = accounts.effective_plan(account)
+        settings = scope_settings_for_plan(settings, account.plan)
+        settings = settings.apply_overrides(
+            {"code_root": str(code_root_for(settings.code_root, account.id))}
+        )
+
+        # 限流按**账号**算（不是按 IP）：一把令牌被拿去刷，只影响它自己的额度
+        guard_key = f"api:{account.id}"
+        decision = self.server.guard.acquire(  # type: ignore[attr-defined]
+            guard_key,
+            per_minute=plan.per_minute,
+            max_concurrent=plan.max_concurrent,
+        )
+        if not decision.allowed:
+            self._reject_by_limit(decision)
+            return
+
+        run_id = uuid.uuid4().hex[:12]
+        # 先落台账再干活：并发重发撞上同一个幂等键时，靠数据库的唯一索引分辨
+        created = accounts.create_api_run(
+            run_id,
+            account_id=account.id,
+            agent=agent_name,
+            task=task,
+            token_id=str(token["id"]),
+            session_id=session_id or "",
+            request_key=request_key,
+            callback_url=callback_url,
+        )
+        if not created:
+            existing = (
+                accounts.find_api_run_by_key(account.id, request_key) if request_key else None
+            )
+            self.server.guard.release(guard_key)  # type: ignore[attr-defined]
+            if existing is not None:
+                self._replay_api_run(existing)
+                return
+            self._send_json({"error": "任务提交冲突，请稍后重试。"}, status=409)
+            return
+
+        job = {
+            "account": account,
+            "token": token,
+            "run_id": run_id,
+            "agent_name": agent_name,
+            "task": task,
+            "session_id": session_id,
+            "max_steps": max_steps,
+            "settings": settings,
+            "guard_key": guard_key,
+            "request_key": request_key,
+        }
+        if wants_async:
+            # 丢后台线程，立刻把 run_id 交出去——长任务不该让客户端干等
+            threading.Thread(
+                target=self._execute_api_job,
+                kwargs=job,
+                name=f"agentcode-api-{run_id}",
+                daemon=True,
+            ).start()
+            accepted: dict[str, Any] = {
+                "run_id": run_id,
+                "status": "running",
+                "agent": agent_name,
+                "session_id": session_id or "",
+                "poll": f"/v1/runs/{run_id}",
+                "usage": {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0},
+                "elapsed_ms": 0,
+            }
+            if callback_url:
+                accepted["callback"] = callback_summary(
+                    {"callback_url": callback_url, "callback_status": "pending"}
+                )
+            self._send_json(accepted, status=202)
+            return
+
+        body = self._execute_api_job(**job)
+        if body.get("success"):
+            self._send_json(body)
+            return
+        self._send_json(body, status=502)
+
+    def _validated_callback_url(
+        self, payload: dict[str, Any], settings: Settings, *, wants_async: bool
+    ) -> str | None:
+        """校验回调地址。返回 ``""`` 表示这次请求没有回调，``None`` 表示已经回了 400。
+
+        三件事在这里一次说清：只对异步任务有意义、服务端得签得了名、
+        地址不能打到内网去。**收单之前**说清，比事后发不出去强。
+        """
+        raw = str(payload.get("callback_url") or "").strip()
+        if not raw:
+            return ""
+        if not wants_async:
+            self._send_json(
+                {
+                    "error": "callback_url 只对异步任务有意义：请同时传 \"async\": true。"
+                    "同步请求的响应里已经有结果了。"
+                },
+                status=400,
+            )
+            return None
+        if not (settings.callback_secret or settings.secret_key):
+            self._send_json(
+                {
+                    "error": "服务端没配回调签名密钥（AGENT_CALLBACK_SECRET 或 AGENT_SECRET_KEY），"
+                    "没法给回调签名，所以不能接受 callback_url。"
+                },
+                status=400,
+            )
+            return None
+        from agentcode.callbacks import callback_ports, validate_callback_url
+
+        try:
+            return validate_callback_url(
+                raw,
+                allow_private=settings.callback_allow_private,
+                ports=callback_ports(settings),
+            )
+        except AgentCodeError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return None
+
+    def _replay_api_run(self, record: dict[str, Any]) -> None:
+        """把同一个幂等键的那一单原样还回去——**不重跑、不重复扣费**。"""
+        status = str(record.get("status") or "")
+        body: dict[str, Any] = {
+            "run_id": record["run_id"],
+            "agent": record["agent"],
+            "session_id": record["session_id"] or "",
+            "idempotent_replay": True,
+        }
+        callback = callback_summary(record)
+        if callback.get("enabled"):
+            body["callback"] = callback
+        if status == "running":
+            # 还在跑：告诉调用方"就是这一单，去轮询"，而不是再开一单
+            body.update(
+                {
+                    "status": "running",
+                    "poll": f"/v1/runs/{record['run_id']}",
+                    "usage": {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0},
+                    "elapsed_ms": 0,
+                }
+            )
+            self._send_json(body, status=202)
+            return
+        body.update(dict(record.get("result") or {}))
+        body["idempotent_replay"] = True
+        body["status"] = status
+        if status == "succeeded":
+            self._send_json(body)
+            return
+        body.setdefault("error", record.get("error") or "任务没能完成。")
+        self._send_json(body, status=502)
+
+    def _execute_api_job(
+        self,
+        *,
+        account: Account,
+        token: dict[str, Any],
+        run_id: str,
+        agent_name: str,
+        task: str,
+        session_id: str | None,
+        max_steps: int | None,
+        settings: Settings,
+        guard_key: str,
+        request_key: str = "",
+    ) -> dict[str, Any]:
+        """真正跑一次任务：同步直接调用它，异步在后台线程里调用它。
+
+        两条路**同一段代码**——否则迟早出现"同步和异步行为不一样"。
+        无论成功失败，结果都写回台账（``api_runs``），进程重启后还取得到。
+        """
+        from agentcode import audit as AUDIT
+        from agentcode.web.runner import run_stream
+
+        accounts: AccountStore = self.server.accounts  # type: ignore[attr-defined]
+        # 后端由服务端决定：调用方不能在请求里挑 mock 去拿假答案
+        llm_mode = str(getattr(self.server, "llm_mode", "mock"))
+        started = time.perf_counter()
+        answer_event: dict[str, Any] | None = None
+        error_message = ""
+        try:
+            for event in run_stream(
+                agent_name,
+                task,
+                llm_mode=llm_mode,
+                max_steps=max_steps,
+                settings=settings,
+                session_store=self.server.store_for(account.id),  # type: ignore[attr-defined]
+                session_id=session_id,
+            ):
+                if event.get("type") == "answer":
+                    answer_event = event
+                elif event.get("type") == "error":
+                    error_message = str((event.get("data") or {}).get("message") or "任务没能完成。")
+        except Exception as exc:  # noqa: BLE001 - 失败也要如实告诉调用方
+            error_message = f"运行失败：{exc}"
+        finally:
+            # 闸门在这里放：异步任务的并发名额要占到跑完，否则并发限制成了摆设
+            self.server.guard.release(guard_key)  # type: ignore[attr-defined]
+
+        elapsed_ms = round((time.perf_counter() - started) * 1000)
+        data = dict((answer_event or {}).get("data") or {})
+        usage = dict(data.get("usage") or {})
+        total_tokens = int(usage.get("total_tokens") or 0)
+        # 记账走同一条账本：网页、CLI、API 的用量从同一个地方算钱
+        accounts.record_usage(
+            account.id,
+            total_tokens,
+            calls=1,
+            run_id=run_id,
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=usage.get("completion_tokens"),
+        )
+        self._audit(
+            AUDIT.API_RUN,
+            account=account,
+            target=agent_name,
+            result="ok" if not error_message else "error",
+            detail={
+                # 叫 token_name 不叫 token：审计的敏感字段过滤把 "token" 这类键一律
+                # 抹成 ***（那条规则是对的），而且这样写也不会有人顺手把明文塞进来
+                "token_name": token["name"],
+                "agent": agent_name,
+                "tokens": total_tokens,
+                "session_id": session_id or "",
+                "ms": elapsed_ms,
+                "idempotency_key": request_key,
+            },
+        )
+
+        body = {
+            "run_id": run_id,
+            "agent": agent_name,
+            "llm_mode": llm_mode,
+            "session_id": session_id or "",
+            "success": not error_message,
+            "answer": str(data.get("answer") or ""),
+            "artifacts": data.get("artifacts") or [],
+            "usage": {
+                "total_tokens": total_tokens,
+                "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+                "completion_tokens": int(usage.get("completion_tokens") or 0),
+            },
+            "elapsed_ms": elapsed_ms,
+        }
+        if error_message:
+            body["error"] = error_message
+        accounts.finish_api_run(run_id, result=body, error=error_message)
+        return body
+
+    def _serve_api_run_status(self, run_id: str) -> None:
+        """GET /v1/runs/<run_id>：这一单跑到哪了、结果是什么。"""
+        gate = self._api_gate()
+        if gate is None:
+            return
+        account, _token = gate
+        store: AccountStore = self.server.accounts  # type: ignore[attr-defined]
+        record = store.api_run(run_id)
+        if record is None or record["account_id"] != account.id:
+            # 别人的任务和"不存在"回一样的东西：别泄露别人跑过什么
+            self._send_json({"error": f"没有这个任务：{run_id}。"}, status=404)
+            return
+        result = dict(record.get("result") or {})
+        body: dict[str, Any] = {
+            "run_id": record["run_id"],
+            "status": record["status"],
+            "agent": record["agent"],
+            "task": record["task"],
+            "session_id": record["session_id"] or "",
+            "created_at": record["created_at"],
+            "finished_at": record["finished_at"] or "",
+        }
+        if record["status"] == "succeeded":
+            body.update(
+                {
+                    "success": True,
+                    "answer": result.get("answer", ""),
+                    "artifacts": result.get("artifacts", []),
+                    "usage": result.get("usage", {}),
+                    "elapsed_ms": result.get("elapsed_ms", 0),
+                }
+            )
+        elif record["status"] == "failed":
+            body.update(
+                {
+                    "success": False,
+                    "error": record["error"] or result.get("error") or "任务没能完成。",
+                    "usage": result.get("usage", {}),
+                }
+            )
+        else:
+            body["success"] = None
+        callback = callback_summary(record)
+        if callback.get("enabled"):
+            body["callback"] = callback
+        self._send_json(body)
+
+    def _serve_api_runs(self) -> None:
+        """GET /v1/runs：最近的任务列表（不带结果正文，免得响应太大）。"""
+        gate = self._api_gate()
+        if gate is None:
+            return
+        account, _token = gate
+        query = parse_qs(urlsplit(self.path).query)
+        try:
+            limit = int((query.get("limit") or ["20"])[0])
+        except ValueError:
+            limit = 20
+        store: AccountStore = self.server.accounts  # type: ignore[attr-defined]
+        self._send_json({"runs": store.api_runs(account.id, limit=max(1, min(100, limit)))})
+
+    def _may_access_run(self, record: Any) -> bool:
+        """登录模式下只能看自己的运行；免登录模式不设限。"""
+        if not getattr(self.server, "require_auth", True):
+            return True
+        account = getattr(self, "_account", None)
+        if account is None:
+            return False
+        return record.account_id in (None, account.id)
+
+    def _begin_sse(self) -> None:
+        """开始一条 SSE 响应。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def _write_event(self, event: dict[str, Any]) -> None:
+        """按 SSE 协议写一条事件并立刻冲刷。"""
+        chunk = (
+            f"event: {event['type']}\n"
+            f"data: {json.dumps(event.get('data') or {}, ensure_ascii=False)}\n\n"
+        )
+        self.wfile.write(chunk.encode("utf-8"))
+        self.wfile.flush()
+
+    def _stream_run(self, record: Any, from_index: int = 0) -> None:
+        """把某个运行的事件流出去。
+
+        浏览器断开只会让**这条订阅**结束，运行本身在注册表里继续跑，
+        重新连上来（``/api/run/stream``）就能把漏掉的事件补回来。
+        """
+        self._begin_sse()
+        try:
+            self._write_event({"type": "run", "data": record.summary()})
+            for event in self._registry().subscribe(record, from_index):
+                self._write_event(event)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            self._log_access(200)
+
+    def _serve_runs(self) -> None:
+        """列出运行记录；带 ``session_id`` 时只看这个会话。"""
+        query = parse_qs(urlsplit(self.path).query)
+        session_id = (query.get("session_id") or [""])[0]
+        account = getattr(self, "_account", None)
+        runs = self._registry().list(
+            session_id=session_id or None,
+            account_id=account.id if account is not None else None,
+        )
+        self._send_json({"runs": runs})
+
+    def _serve_run_resume(self) -> None:
+        """重连：从指定下标继续把某个运行的事件流出去。"""
+        query = parse_qs(urlsplit(self.path).query)
+        run_id = (query.get("run_id") or [""])[0]
+        try:
+            from_index = max(0, int((query.get("from") or ["0"])[0]))
+        except (TypeError, ValueError):
+            from_index = 0
+
+        record = self._registry().get(run_id)
+        if record is None:
+            self._send_json(
+                {"error": "找不到这个运行，它可能已经结束很久、记录被回收了。"}, status=404
+            )
+            return
+        if not self._may_access_run(record):
+            self._send_json({"error": "无权访问这个运行。"}, status=403)
+            return
+        self._stream_run(record, from_index)
+
+    def _serve_static(self, name: str) -> None:
+        """返回静态文件，并阻止路径穿越。"""
+        target = (STATIC_DIR / name).resolve()
+        if STATIC_DIR not in target.parents or not target.is_file():
+            self._send_json({"error": "静态资源不存在。"}, status=404)
+            return
+        content_type = _CONTENT_TYPES.get(target.suffix.lower(), "application/octet-stream")
+        self._send(200, target.read_bytes(), content_type)
+
+    def _read_json(self) -> dict[str, Any] | None:
+        """读取并解析请求体，失败时直接返回 400。"""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._send_json({"error": "请求长度不合法。"}, status=400)
+            return None
+        if length <= 0:
+            self._send_json({"error": "请求体为空。"}, status=400)
+            return None
+        if length > MAX_BODY_BYTES:
+            self._drain_body(MAX_BODY_BYTES * 16)  # 不然客户端会拿到"连接被中止"
+            self._send_json({"error": "请求体过大。"}, status=413)
+            return None
+        raw = self.rfile.read(length)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_json({"error": "请求体不是合法的 JSON。"}, status=400)
+            return None
+        if not isinstance(payload, dict):
+            self._send_json({"error": "请求体必须是 JSON 对象。"}, status=400)
+            return None
+        return payload
+
+    # ----------------------------------------------------------------- 路由
+
+    def do_GET(self) -> None:  # noqa: N802 - 父类约定的方法名
+        self._begin_request()
+        path = self.path.split("?", 1)[0]
+        if path == "/healthz":
+            self._send_json(
+                {
+                    "status": "ok",
+                    "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "accounts": len(self.server.accounts.list()),  # type: ignore[attr-defined]
+                }
+            )
+            return
+        if path in ("/", "/index.html"):
+            self._serve_static("index.html")
+            return
+        if path.startswith("/static/"):
+            self._serve_static(path[len("/static/") :])
+            return
+        # 隐私政策与用户协议必须免登录可读——没登录的人也有权知道你怎么处理他的数据
+        if path in ("/privacy", "/privacy.html"):
+            self._serve_static("privacy.html")
+            return
+        if path in ("/terms", "/terms.html"):
+            self._serve_static("terms.html")
+            return
+        if path == "/metrics":
+            self._serve_metrics()
+            return
+        if path == "/api/me":
+            account = getattr(self, "_account", None)
+            if account is None:
+                self._send_json({"error": "未登录。"}, status=401)
+                return
+            self._send_json({"account": self._account_payload(account)})
+            return
+        # 其余接口都需要登录
+        if path.startswith("/api/") and not self._auth_ok():
+            return
+        if path.startswith("/api/"):
+            decision = self.server.guard.check_request(self._client_key())  # type: ignore[attr-defined]
+            if not decision.allowed:
+                self._reject_by_limit(decision)
+                return
+        if path == "/api/agents":
+            self._send_json(agents_payload(self._settings()))
+            return
+        if path == "/api/config":
+            self._send_json(config_payload(self._settings()))
+            return
+        if path == "/api/sessions":
+            self._send_json({"sessions": self._store().list()})
+            return
+        if path == "/api/session":
+            store = self._store()
+            query = parse_qs(urlsplit(self.path).query)
+            session_id = (query.get("id") or [""])[0]
+            record = store.record(session_id) if session_id else None
+            self._send_json(
+                {
+                    "session": record.summary() if record is not None else None,
+                    "messages": [dict(message) for message in record.messages]
+                    if record is not None
+                    else [],
+                }
+            )
+            return
+        if path == "/api/file":
+            self._serve_code_file()
+            return
+        if path == "/api/runs":
+            self._serve_runs()
+            return
+        if path == "/api/run/stream":
+            self._serve_run_resume()
+            return
+        if path == "/api/plans":
+            self._send_json({"plans": [plan.to_dict() for plan in self._billing().plans()]})
+            return
+        if path == "/api/billing":
+            account = getattr(self, "_account", None)
+            if account is None:
+                self._send_json({"error": "请先登录。"}, status=401)
+                return
+            self._send_json(self._billing().my_billing(account))
+            return
+        if path == "/api/export":
+            self._serve_export()
+            return
+        if path == "/api/trash":
+            self._serve_trash()
+            return
+        if path == "/api/account/email":
+            self._serve_email()
+            return
+        if path == "/api/tokens":
+            self._serve_tokens()
+            return
+        if path == "/v1/me":
+            self._serve_api_me()
+            return
+        if path == "/v1/runs":
+            self._serve_api_runs()
+            return
+        if path.startswith("/v1/runs/"):
+            self._serve_api_run_status(path[len("/v1/runs/") :])
+            return
+        self._send_json({"error": f"未找到路径 {path}。"}, status=404)
+
+    def _account_payload(self, account: Account) -> dict[str, Any]:
+        """给前端的账号信息：名字、套餐、今日额度。"""
+        store: AccountStore = self.server.accounts  # type: ignore[attr-defined]
+        plan = store.effective_plan(account)
+        used, calls = store.usage_today(account.id)
+        limit = store.daily_limit(account)
+        unlimited = limit <= 0
+        return {
+            "name": account.name,
+            "plan": account.plan,
+            "email": account.email or "",
+            "plan_title": plan.title,
+            "plan_expires_at": account.plan_expires_at,
+            "unlimited": unlimited,
+            "daily_token_limit": limit,
+            "used_today": used,
+            "calls_today": calls,
+            "remaining": -1 if unlimited else max(0, limit - used),
+        }
+
+    def _serve_code_file(self) -> None:
+        """读取代码工作目录里的文本文件，供页面点击查看。"""
+        query = parse_qs(urlsplit(self.path).query)
+        relative = (query.get("path") or [""])[0]
+        if not relative:
+            self._send_json({"error": "缺少 path 参数。"}, status=400)
+            return
+
+        account = getattr(self, "_account", None)
+        root = code_root_for(
+            self._settings().code_root, account.id if account is not None else None
+        )
+        try:
+            target = resolve_in_root(root, relative)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        if not target.is_file():
+            self._send_json({"error": f"文件不存在：{relative}"}, status=404)
+            return
+
+        try:
+            text = target.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            self._send_json({"error": f"读取失败：{exc}"}, status=500)
+            return
+
+        truncated = len(text) > MAX_FILE_CHARS
+        self._send_json(
+            {
+                "path": target.relative_to(root).as_posix(),
+                "content": text[:MAX_FILE_CHARS],
+                "bytes": target.stat().st_size,
+                "truncated": truncated,
+            }
+        )
+
+    def do_POST(self) -> None:  # noqa: N802 - 父类约定的方法名
+        from agentcode import audit as AUDIT
+        from agentcode.web.runner import run_stream  # 延迟导入，避免循环依赖
+
+        self._begin_request()
+        path = self.path.split("?", 1)[0]
+        if path not in (
+            "/api/login",
+            "/api/logout",
+            "/api/run",
+            "/api/billing/checkout",
+            "/api/account/purge-code",
+            "/api/account/delete",
+            "/api/upload",
+            "/api/session/reset",
+            "/api/sessions/create",
+            "/api/sessions/rename",
+            "/api/sessions/delete",
+            "/api/trash/restore",
+            "/api/trash/purge",
+            "/api/trash/empty",
+            "/api/account/email",
+            "/v1/run",
+            "/api/tokens/create",
+            "/api/tokens/revoke",
+        ):
+            self._drain_body()
+            self._send_json({"error": f"未找到路径 {path}。"}, status=404)
+            return
+
+        if path == "/api/login":
+            payload = self._read_json()
+            if payload is None:
+                return
+            # 登录单独限流，防密码暴力试探
+            decision = self.server.login_guard.check_request(  # type: ignore[attr-defined]
+                f"login:{self.client_address[0] if self.client_address else 'unknown'}"
+            )
+            if not decision.allowed:
+                self._reject_by_limit(decision)
+                return
+            self._handle_login(payload)
+            return
+
+        if path == "/v1/run":
+            # 对外接口：认令牌、不认 cookie，所以要在 _auth_ok() 之前处理
+            payload = self._read_json()
+            if payload is None:
+                return
+            self._serve_api_run(payload)
+            return
+
+        if path == "/api/logout":
+            # 登出不需要请求体：必须在读 body 之前处理，否则空 body 会被判 400
+            # （但还是要把它读掉——见 _drain_body 的说明）
+            self._drain_body()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Set-Cookie", clear_cookie())
+            body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            self._log_access(200)
+            return
+
+        if path == "/api/upload":
+            # 上传的 body 是文件原文，不是 JSON——必须在 _read_json() 之前处理
+            self._handle_upload()
+            return
+
+        payload = self._read_json()
+        if payload is None:
+            return
+
+        if not self._auth_ok():
+            return
+        account = getattr(self, "_account", None)
+
+        if path == "/api/billing/checkout":
+            # 管理动作（确认到账、直接开通）只在 CLI，网页这边只负责下单
+            if account is None:
+                self._send_json({"error": "请先登录。"}, status=401)
+                return
+            try:
+                order = self._billing().checkout(
+                    account,
+                    str(payload.get("plan") or ""),
+                    int(payload.get("months") or 1),
+                )
+            except (AgentCodeError, TypeError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json(
+                {
+                    "order": order.to_dict(),
+                    "message": "订单已创建。请按约定方式付款，管理员确认到账后套餐立即生效。",
+                }
+            )
+            return
+
+        if path == "/api/account/purge-code":
+            self._purge_code()
+            return
+
+        if path == "/api/account/delete":
+            self._delete_account(payload)
+            return
+
+        if path == "/api/account/email":
+            self._set_email(payload)
+            return
+
+        if path == "/api/tokens/create":
+            self._create_token(payload)
+            return
+
+        if path == "/api/tokens/revoke":
+            self._revoke_token(payload)
+            return
+
+        if path == "/api/trash/restore":
+            self._restore_from_trash(payload)
+            return
+
+        if path == "/api/trash/purge":
+            self._purge_from_trash(payload)
+            return
+
+        if path == "/api/trash/empty":
+            self._empty_trash()
+            return
+
+        session_store: SessionStore = self._store()
+        raw_session = str(payload.get("session_id") or "").strip()
+        session_id = raw_session or None
+
+        if path == "/api/session/reset":
+            removed = session_store.reset(session_id) if session_id else False
+            self._audit(AUDIT.SESSION_RESET, target=session_id or "", detail={"reset": removed})
+            self._send_json({"reset": removed, "session_id": session_id})
+            return
+
+        if path == "/api/sessions/create":
+            record = session_store.create(name=payload.get("name"))
+            self._send_json({"session": record.summary()})
+            return
+
+        if path == "/api/sessions/rename":
+            renamed = session_store.rename(session_id or "", payload.get("name"))
+            record = session_store.record(session_id or "")
+            self._audit(
+                AUDIT.SESSION_RENAME,
+                target=str(payload.get("name") or ""),
+                detail={"session_id": session_id, "renamed": renamed},
+            )
+            self._send_json(
+                {
+                    "renamed": renamed,
+                    "session": record.summary() if record is not None else None,
+                }
+            )
+            return
+
+        if path == "/api/sessions/delete":
+            record = session_store.record(session_id or "")
+            deleted = session_store.delete(session_id or "")
+            self._audit(
+                AUDIT.SESSION_DELETE,
+                target=(record.name if record is not None else session_id or ""),
+                detail={"session_id": session_id, "deleted": deleted, "soft": True},
+            )
+            self._send_json({"deleted": deleted, "recoverable": True})
+            return
+
+        task = str(payload.get("task") or "").strip()
+        if not task:
+            self._send_json({"error": "任务不能为空，请输入要交给智能体的问题。"}, status=400)
+            return
+
+        agent_name = str(payload.get("agent") or "react")
+        requested_mode = payload.get("llm")
+        llm_mode = (
+            requested_mode
+            if requested_mode in ("mock", "openai")
+            else getattr(self.server, "llm_mode", "mock")
+        )
+        raw_max_steps = payload.get("max_steps")
+        max_steps = (
+            int(raw_max_steps) if isinstance(raw_max_steps, int) and raw_max_steps > 0 else None
+        )
+
+        settings = self._settings()
+        accounts: AccountStore = self.server.accounts  # type: ignore[attr-defined]
+        if account is not None:
+            allowed, reason = accounts.check_quota(account)
+            if not allowed:
+                REJECTIONS.inc(reason="quota")
+                self._notify_quota(account)
+                self._send_json({"error": reason}, status=402)
+                return
+        # 套餐收口：免费套餐不允许执行代码时，连工具都不下发给模型
+        settings = scope_settings_for_plan(
+            settings, account.plan if account is not None else None
+        )
+        plan = accounts.effective_plan(account) if account is not None else None
+        # 代码工作目录也按账号分一层——否则 A 写的文件 B 能读到（见 code_root_for）
+        settings = settings.apply_overrides(
+            {
+                "code_root": str(
+                    code_root_for(
+                        settings.code_root, account.id if account is not None else None
+                    )
+                )
+            }
+        )
+
+        # 频率 + 并发闸门：一次任务会调用模型十几次，只在开头查每日额度挡不住并发
+        guard_key = self._client_key()
+        decision = self.server.guard.acquire(  # type: ignore[attr-defined]
+            guard_key,
+            per_minute=plan.per_minute if plan else None,
+            max_concurrent=plan.max_concurrent if plan else None,
+        )
+        if not decision.allowed:
+            self._reject_by_limit(decision)
+            return
+
+        def on_finish(finished: Any) -> None:
+            """运行结束时的收尾：结算用量、放掉并发闸门。
+
+            挂在这里而不是请求循环里——用户刷新页面把连接掐了，
+            额度照样要扣，闸门也照样要放，不然这个用户就被自己锁死了。
+            """
+            if account is not None:
+                answer = finished.answer_event() or {}
+                usage = (answer.get("data") or {}).get("usage") or {}
+                accounts.record_usage(
+                    account.id,
+                    int(usage.get("total_tokens") or 0),
+                    calls=1,
+                    run_id=finished.id,
+                    # 输入/输出分开记：计价靠它（两者单价差好几倍）
+                    prompt_tokens=usage.get("prompt_tokens"),
+                    completion_tokens=usage.get("completion_tokens"),
+                )
+            self.server.guard.release(guard_key)  # type: ignore[attr-defined]
+
+        record = self._registry().start(
+            lambda: run_stream(
+                agent_name,
+                task,
+                llm_mode=llm_mode,
+                max_steps=max_steps,
+                settings=settings,
+                session_store=session_store,
+                session_id=session_id,
+            ),
+            agent=agent_name,
+            task=task,
+            session_id=session_id,
+            account_id=account.id if account is not None else None,
+            on_finish=on_finish,
+        )
+        # 首帧就把 run_id 交给前端：连接断了它能凭这个从断点续上
+        self._stream_run(record)
+
+    def _handle_login(self, payload: dict[str, Any]) -> None:
+        """校验账号密码并下发签名 cookie。"""
+        from agentcode import audit as AUDIT
+        from agentcode.audit import AuditLog
+
+        accounts: AccountStore = self.server.accounts  # type: ignore[attr-defined]
+        name = str(payload.get("name") or "").strip()
+        password = str(payload.get("password") or "")
+        account = accounts.verify(name, password)
+        ip = self.client_address[0] if self.client_address else ""
+        if account is None:
+            # 不区分"账号不存在"与"密码错误"，避免账号枚举
+            REJECTIONS.inc(reason="bad_credentials")
+            # 审计里也只记"凭据不对"：写清楚哪个用户名错了就够查，不写字面密码
+            # 这里直接写库而不是走 _audit：此刻不能把"带 cookie 的旧账号"当成操作者
+            AuditLog(self.server.accounts).record(  # type: ignore[attr-defined]
+                AUDIT.LOGIN_FAIL,
+                actor_name=name,
+                result="denied",
+                detail={"reason": "bad_credentials"},
+                ip=ip,
+            )
+            # 连续失败是"有人在猜密码"的信号，提醒账号本人（没填邮箱就跳过）
+            target = accounts.get(name)
+            if target is not None:
+                self._notifier().check_login_failures(account=target)
+            self._send_json({"error": "账号或密码不正确。"}, status=401)
+            return
+
+        self._audit(AUDIT.LOGIN_OK, account=account)
+        token = create_token(account.id, self.server.secret_key)  # type: ignore[attr-defined]
+        body = json.dumps(
+            {"account": self._account_payload(account)}, ensure_ascii=False
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Set-Cookie", build_cookie(token))
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self._account = account
+        self._log_access(200)
+
+
+def create_server(
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    *,
+    llm_mode: str = "mock",
+    env_file: str | None = None,
+    quiet: bool = True,
+    max_sessions: int = DEFAULT_MAX_SESSIONS,
+    session_dir: str | None = None,
+    accounts: AccountStore | None = None,
+    secret_key: str | None = None,
+    require_auth: bool = True,
+    access_log: bool = False,
+    rate_limit_per_minute: int = DEFAULT_PER_MINUTE,
+    max_concurrent_runs: int = DEFAULT_MAX_CONCURRENT,
+) -> ThreadingHTTPServer:
+    """创建（但不启动）网页服务，``port=0`` 时由系统分配端口。
+
+    ``require_auth=False`` 表示免登录（本地自用/自动化测试）；
+    面向公网时必须保持默认的 ``True``。
+    """
+    server = ThreadingHTTPServer((host, port), AgentCodeRequestHandler)
+    server.daemon_threads = True
+    server.llm_mode = llm_mode  # type: ignore[attr-defined]
+    server.env_file = env_file  # type: ignore[attr-defined]
+    server.quiet = quiet  # type: ignore[attr-defined]
+    server.require_auth = require_auth  # type: ignore[attr-defined]
+    server.access_log = access_log  # type: ignore[attr-defined]
+    #: 监听地址决定 /metrics 要不要登录（回环地址才免登录）
+    server.bind_host = host  # type: ignore[attr-defined]
+    server.guard = UsageGuard(  # type: ignore[attr-defined]
+        per_minute=rate_limit_per_minute, max_concurrent=max_concurrent_runs
+    )
+    #: 登录接口单独限流（比常规接口更严，防暴力试探）
+    server.login_guard = UsageGuard(per_minute=10, max_concurrent=50)  # type: ignore[attr-defined]
+    #: 运行注册表：让任务的生命周期独立于浏览器的连接（刷新/断网都能续上）
+    server.registry = RunRegistry()  # type: ignore[attr-defined]
+    base_dir = Path(session_dir or default_session_dir())
+    server.session_base_dir = base_dir  # type: ignore[attr-defined]
+    server.max_sessions = max_sessions  # type: ignore[attr-defined]
+    # 免登录模式下的共享仓库（也用于把老接口跑通）
+    server.sessions = SessionStore(directory=base_dir, max_sessions=max_sessions)  # type: ignore[attr-defined]
+    server.accounts = accounts or AccountStore(  # type: ignore[attr-defined]
+        os.environ.get("AGENT_DB_PATH") or DEFAULT_DB_PATH
+    )
+    # 告警监控：默认只记日志（webhook 为空），serve() 里会用真实配置重建
+    from agentcode.alerts import AlertMonitor
+
+    server.alert_monitor = AlertMonitor()  # type: ignore[attr-defined]
+    # 账单服务：套餐、订单、用量都从这里拿
+    from agentcode.billing import BillingService
+
+    server.billing = BillingService(server.accounts)  # type: ignore[attr-defined]
+    server.secret_key = secret_key or os.environ.get("AGENT_SECRET_KEY") or uuid.uuid4().hex
+    server.store_lock = threading.Lock()  # type: ignore[attr-defined]
+    server.user_stores = {}  # type: ignore[attr-defined]
+
+    def store_for(account_id: str) -> SessionStore:
+        """每个用户一个独立目录的会话仓库（懒加载 + 缓存）。"""
+        with server.store_lock:  # type: ignore[attr-defined]
+            store = server.user_stores.get(account_id)  # type: ignore[attr-defined]
+            if store is None:
+                store = SessionStore(
+                    directory=base_dir / account_id, max_sessions=max_sessions
+                )
+                server.user_stores[account_id] = store  # type: ignore[attr-defined]
+            return store
+
+    server.store_for = store_for  # type: ignore[attr-defined]
+    return server
+
+
+def serve(
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    *,
+    llm_mode: str = "mock",
+    env_file: str | None = None,
+    open_browser: bool = False,
+    quiet: bool = True,
+    max_sessions: int = DEFAULT_MAX_SESSIONS,
+    session_dir: str | None = None,
+    require_auth: bool = True,
+    access_log: bool = True,
+) -> None:
+    """启动网页服务并阻塞，直到用户按 Ctrl+C。"""
+    accounts = AccountStore(os.environ.get("AGENT_DB_PATH") or DEFAULT_DB_PATH)
+    settings_for_limits = Settings.from_env(env_file=env_file)
+    boot_password: str | None = None
+    if require_auth and not accounts.list():
+        # 第一次启动时自动建一个管理员账号，只在这里打印一次密码（类似 Jupyter 的 token）
+        boot_password = secrets.token_urlsafe(9)
+        accounts.create("admin", boot_password, plan="owner")
+
+    try:
+        server = create_server(
+            host,
+            port,
+            llm_mode=llm_mode,
+            env_file=env_file,
+            quiet=quiet,
+            max_sessions=max_sessions,
+            session_dir=session_dir,
+            accounts=accounts,
+            require_auth=require_auth,
+            access_log=access_log,
+            rate_limit_per_minute=settings_for_limits.rate_limit_per_minute,
+            max_concurrent_runs=settings_for_limits.max_concurrent_runs,
+        )
+    except OSError as exc:
+        print(f"启动失败：{host}:{port} 无法监听（{exc}）。")
+        print(f"端口可能已被占用，请换一个端口，例如 --port {port + 1}。")
+        return
+
+    # 告警监控：每 60 秒拍一次指标快照，按阈值判断，命中就记日志/推 webhook
+    from agentcode.alerts import AlertMonitor, run_alert_loop
+
+    monitor = AlertMonitor(
+        webhook=settings_for_limits.alert_webhook or "",
+        window_seconds=settings_for_limits.alert_window_seconds,
+        cooldown_seconds=settings_for_limits.alert_cooldown_seconds,
+        error_rate=settings_for_limits.alert_error_rate,
+    )
+    server.alert_monitor = monitor  # type: ignore[attr-defined]
+    threading.Thread(
+        target=run_alert_loop, args=(monitor,), name="agentcode-alerts", daemon=True
+    ).start()
+
+    # 任务完成回调：异步任务跑完后主动通知调用方。投递状态在库里，
+    # 所以这个循环重启之后还能把没发出去的回调接着发。
+    if settings_for_limits.api_enabled:
+        from agentcode.callbacks import run_callback_loop
+
+        threading.Thread(
+            target=run_callback_loop,
+            args=(accounts, settings_for_limits),
+            name="agentcode-callbacks",
+            daemon=True,
+        ).start()
+        has_callback_secret = bool(
+            settings_for_limits.callback_secret or settings_for_limits.secret_key
+        )
+        print(
+            "任务完成回调：已开启"
+            + (
+                "（签名密钥已配置）"
+                if has_callback_secret
+                else "（未配签名密钥，带 callback_url 的请求会被拒绝）"
+            )
+        )
+    else:
+        print("任务完成回调：对外 API 已关闭，不投递回调")
+
+    # 数据留存：默认不自动清理（AGENT_RETENTION_DAYS=0），删不删由用户自己决定。
+    # 配了就先扫一遍，然后每天扫一次。
+    if settings_for_limits.retention_days > 0:
+        from agentcode.lifecycle import run_retention_loop, sweep_expired
+
+        swept = sweep_expired(
+            settings_for_limits,
+            [account.id for account in accounts.list()],
+            days=settings_for_limits.retention_days,
+        )
+        print(
+            f"数据留存：自动清理超过 {settings_for_limits.retention_days} 天的会话与代码文件"
+            f"（启动时清掉 {swept['removed']} 个）"
+        )
+        threading.Thread(
+            target=run_retention_loop,
+            args=(accounts, settings_for_limits),
+            name="agentcode-retention",
+            daemon=True,
+        ).start()
+    else:
+        print("数据留存：不自动清理，删不删由用户自己在网页上决定")
+
+    # 定期清理：回收站（AGENT_TRASH_DAYS）与审计日志（AGENT_AUDIT_DAYS）。
+    # 启动时先扫一遍，之后交给后台循环——都是"过了保留期就该消失"的杂活。
+    from agentcode.lifecycle import housekeeping_once, run_housekeeping_loop
+
+    cleaned = housekeeping_once(accounts, settings_for_limits)
+    trash_kept = int(settings_for_limits.trash_days)
+    audit_kept = int(settings_for_limits.audit_days)
+    print(
+        "回收站："
+        + (
+            f"保留 {trash_kept} 天（启动时清掉 {cleaned['trash']['sessions'] + cleaned['trash']['code']} 项）"
+            if trash_kept > 0
+            else "不自动清理，里面的东西一直留着"
+        )
+    )
+    print(
+        "审计日志："
+        + (
+            f"保留 {audit_kept} 天（启动时清掉 {cleaned['audit']} 条）"
+            if audit_kept > 0
+            else "永久保留"
+        )
+    )
+    threading.Thread(
+        target=run_housekeeping_loop,
+        args=(accounts, settings_for_limits),
+        name="agentcode-housekeeping",
+        daemon=True,
+    ).start()
+
+    # 自动备份：默认关闭（AGENT_BACKUP_DIR 不配就不备）。配了就先在后台查一次
+    # ——"今天还没有备份"恰恰是启动这一刻的状态——之后每小时看一次。
+    # 放后台线程：备份要读全量数据，不能拖慢服务起来。
+    if settings_for_limits.backup_dir:
+        from agentcode.backup import run_backup_loop
+
+        threading.Thread(
+            target=run_backup_loop,
+            args=(settings_for_limits,),
+            name="agentcode-backup",
+            daemon=True,
+        ).start()
+        print(
+            f"自动备份：已开启（目录 {settings_for_limits.backup_dir}，"
+            f"间隔 {settings_for_limits.backup_interval_hours:g} 小时，"
+            f"保留 {settings_for_limits.backup_keep} 份）"
+        )
+    else:
+        print("自动备份：未开启（要定时备份就配 AGENT_BACKUP_DIR）")
+
+    url = f"http://{host}:{server.server_port}"
+    print(f"AgentCode 网页已启动：{url}")
+    print(f"默认模型模式：{llm_mode}（页面上不显示模式，一切走这个设置）")
+    print(
+        f"限流：每人每分钟 {settings_for_limits.rate_limit_per_minute} 次请求，"
+        f"同时最多 {settings_for_limits.max_concurrent_runs} 个任务；"
+        f"单次任务 token 预算 {settings_for_limits.run_token_budget}"
+    )
+    if monitor.webhook:
+        print(
+            f"告警：已开启（窗口 {monitor.window_seconds:g} 秒，"
+            f"错误率阈值 {monitor.error_rate:.0%}，命中后推到配置的 webhook）"
+        )
+    else:
+        print("告警：只在日志里报，不推送（要推送就配 AGENT_ALERT_WEBHOOK）")
+    print(f"指标：{url}/metrics")
+    if require_auth:
+        if boot_password:
+            print("=" * 56)
+            print(f"已创建初始账号　用户名：admin　密码：{boot_password}")
+            print("请立刻记下这个密码，它只显示这一次。")
+            print("=" * 56)
+        print("登录后才能使用；需要给他人开账号：agentcode user add <名字>")
+    else:
+        print("⚠ 免登录模式：任何能访问这个端口的人都能用你的模型额度，仅限本机自用。")
+    print("这个窗口就是服务本身：关闭窗口或按 Ctrl+C 即可停止。")
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已停止服务。")
+    finally:
+        server.server_close()

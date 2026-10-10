@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AgentCode 智能体</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <div class="login" id="login" hidden>
+      <form class="login-card" id="login-form">
+        <h2>登录 AgentCode</h2>
+        <p class="login-hint">用管理员分配给你的账号登录。没有账号时，请管理员执行
+          <code>agentcode user add 你的名字</code>。</p>
+        <label for="login-name">账号</label>
+        <input id="login-name" name="name" autocomplete="username" required />
+        <label for="login-password">密码</label>
+        <input
+          id="login-password"
+          name="password"
+          type="password"
+          autocomplete="current-password"
+          required
+        />
+        <button type="submit" class="primary" id="login-button">登录</button>
+        <p class="login-error" id="login-error" role="alert"></p>
+      </form>
+    </div>
+
+    <div class="flow" aria-hidden="true">
+      <span class="blob blob-a"></span>
+      <span class="blob blob-b"></span>
+      <span class="blob blob-c"></span>
+    </div>
+
+    <div class="app">
+      <aside class="sidebar" id="sidebar">
+        <button type="button" id="new-session-button" class="new-chat">＋ 新会话</button>
+
+        <p class="sidebar-label">会话</p>
+        <div id="session-list" class="session-list"></div>
+
+        <button
+          type="button"
+          id="agent-toggle"
+          class="sidebar-toggle"
+          aria-expanded="true"
+          aria-controls="agent-list"
+        >
+          <span class="toggle-arrow" aria-hidden="true">▾</span>
+          <span id="agent-toggle-label">智能体</span>
+        </button>
+        <div id="agent-list" class="agent-list"></div>
+
+        <div class="account" id="account" hidden>
+          <span class="account-name" id="account-name"></span>
+          <span class="account-quota" id="account-quota"></span>
+          <button type="button" id="billing-toggle" class="link">套餐与用量</button>
+          <button type="button" id="data-toggle" class="link">我的数据</button>
+          <button type="button" id="token-toggle" class="link">API</button>
+          <button type="button" id="logout-button" class="link">退出</button>
+        </div>
+
+        <section id="billing-panel" class="billing-panel" hidden>
+          <header class="billing-head">
+            <strong id="billing-plan">—</strong>
+            <span id="billing-expiry" class="billing-expiry"></span>
+            <button type="button" id="billing-close" class="icon" aria-label="关闭">✕</button>
+          </header>
+          <div class="billing-usage">
+            <div class="billing-bar"><span id="billing-bar-fill"></span></div>
+            <p id="billing-usage-text" class="billing-usage-text"></p>
+          </div>
+          <div class="billing-plans" id="billing-plans"></div>
+          <ul class="billing-orders" id="billing-orders"></ul>
+        </section>
+
+        <section id="data-panel" class="billing-panel" hidden>
+          <header class="billing-head">
+            <strong>我的数据</strong>
+            <span class="billing-expiry">随时导出或删除</span>
+            <button type="button" id="data-close" class="icon" aria-label="关闭">✕</button>
+          </header>
+          <p class="billing-usage-text">
+            导出会把你的全部会话和代码目录打包成 zip。删掉的东西先进回收站，还能找回来。
+          </p>
+          <div class="data-actions">
+            <button type="button" id="data-export" class="data-button">导出我的数据</button>
+            <button type="button" id="data-purge" class="data-button">清空代码目录</button>
+            <button type="button" id="data-delete" class="data-button is-danger">
+              注销账号…
+            </button>
+          </div>
+          <section class="notify">
+            <strong>接收通知的邮箱</strong>
+            <p class="billing-usage-text">
+              套餐到期、额度用尽、账号被人猜密码、注销完成时通知到这里。
+              留空＝不接收。只用来发服务通知，不会拿去做别的。
+            </p>
+            <div class="notify-row">
+              <input
+                id="notify-email"
+                type="email"
+                autocomplete="email"
+                placeholder="you@example.com"
+              />
+              <button type="button" id="notify-save" class="data-button">保存</button>
+            </div>
+          </section>
+          <section class="trash">
+            <header class="trash-head">
+              <strong>回收站</strong>
+              <span class="billing-expiry" id="trash-hint"></span>
+            </header>
+            <div id="trash-list" class="trash-list"></div>
+            <div class="data-actions">
+              <button type="button" id="trash-empty" class="data-button is-danger">
+                清空回收站
+              </button>
+            </div>
+          </section>
+          <div id="data-confirm" class="data-confirm" hidden>
+            <p class="billing-usage-text">
+              这会删掉你的账号、全部会话、全部代码与上传的文件（包括回收站里
+              留的那些），<strong>不可撤销</strong>。
+              输入你的用户名 <code id="data-confirm-name"></code> 以确认：
+            </p>
+            <input id="data-confirm-input" autocomplete="off" />
+            <div class="data-confirm-row">
+              <button type="button" id="data-confirm-cancel" class="data-button">取消</button>
+              <button type="button" id="data-confirm-ok" class="data-button is-danger">
+                确认注销
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <section id="token-panel" class="billing-panel" hidden>
+          <header class="billing-head">
+            <strong>API 令牌</strong>
+            <span class="billing-expiry">给脚本和 CI 用</span>
+            <button type="button" id="token-close" class="icon" aria-label="关闭">✕</button>
+          </header>
+          <p class="billing-usage-text">
+            带着 <code>Authorization: Bearer 令牌</code> 调
+            <code>POST /v1/run</code> 就能跑智能体，
+            <code>GET /v1/me</code> 查额度。字段与示例见 <code>docs/api.md</code>。
+            <strong>明文只显示这一次</strong>，丢了就吊销重建。
+          </p>
+          <div class="notify-row">
+            <input
+              id="token-name"
+              type="text"
+              autocomplete="off"
+              placeholder="给这把令牌起个名字"
+            />
+            <button type="button" id="token-create" class="data-button">新建</button>
+          </div>
+          <div id="token-fresh" class="token-fresh" hidden></div>
+          <div id="token-list" class="token-list"></div>
+        </section>
+
+        <p class="legal-links">
+          <a href="/privacy" target="_blank" rel="noopener">隐私政策</a>
+          ·
+          <a href="/terms" target="_blank" rel="noopener">用户协议</a>
+        </p>
+      </aside>
+
+      <div
+        class="sidebar-resizer"
+        id="sidebar-resizer"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="拖动调整侧栏宽度"
+        tabindex="0"
+      ></div>
+
+      <main class="chat">
+        <header class="chat-head">
+          <span class="chat-title">AgentCode</span>
+          <span id="chat-sub" class="chat-sub"></span>
+        </header>
+
+        <div id="messages" class="messages">
+          <div id="empty" class="welcome">
+            <h2>把任务交给智能体</h2>
+            <p>左侧选一个智能体，写下任务。它会记住这个会话里的上下文，追问时不必重复背景。</p>
+            <div class="samples">
+              <button
+                type="button"
+                class="sample"
+                data-agent="react"
+                data-task="查一下北京今天的天气，再推荐一个景点"
+              >
+                查天气并推荐景点
+              </button>
+              <button
+                type="button"
+                class="sample"
+                data-agent="coding"
+                data-task="实现 is_prime(n) 判断素数，并写 pytest 测试覆盖 2、3、4、9、13"
+              >
+                写代码并跑通测试
+              </button>
+              <button
+                type="button"
+                class="sample"
+                data-agent="plan_and_solve"
+                data-task="周一卖出 15 个苹果，周二翻倍，周三比周二少 5 个，三天共卖出多少"
+              >
+                分步解一道计算题
+              </button>
+              <button
+                type="button"
+                class="sample"
+                data-agent="reflection"
+                data-task="写一个找出 1 到 n 之间所有素数的函数，并说明算法复杂度"
+              >
+                写函数并自我评审
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <form id="run-form" class="composer" novalidate>
+          <div class="composer-box">
+            <textarea
+              id="task"
+              name="task"
+              rows="1"
+              placeholder="给智能体一个任务，回车发送，Shift+回车换行"
+            ></textarea>
+            <button type="submit" id="send-button" class="send" aria-label="运行">↑</button>
+          </div>
+          <div class="upload-row">
+            <button type="button" id="upload-button" class="upload-button">上传文件</button>
+            <span class="upload-hint">也可以把文件直接拖到这里</span>
+            <input type="file" id="upload-input" multiple hidden />
+          </div>
+          <div id="upload-chips" class="upload-chips" hidden></div>
+          <p id="run-status" class="composer-hint" role="status" aria-live="polite"></p>
+        </form>
+      </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

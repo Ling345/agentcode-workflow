@@ -25,7 +25,10 @@ def tracked_files() -> list[str]:
     """用 git 列出被跟踪的文件；没有 git 时退回遍历目录。"""
     try:
         result = subprocess.run(
-            ["git", "ls-files"],
+            # -z：用 NUL 分隔，路径永远不会被转义
+            # （默认配置下 git 会把中文文件名写成 "\345\220..." 这样的转义串，
+            #   拿它当路径去打包就会报 WinError 123）
+            ["git", "-c", "core.quotepath=false", "ls-files", "-z"],
             cwd=str(REPO),
             capture_output=True,
             text=True,
@@ -33,7 +36,7 @@ def tracked_files() -> list[str]:
             errors="replace",
             check=True,
         )
-        files = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        files = [item for item in result.stdout.split("\0") if item]
         if files:
             return files
     except (subprocess.CalledProcessError, FileNotFoundError):

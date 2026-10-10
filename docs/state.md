@@ -23,7 +23,7 @@ AgentCode：一个可扩展的 Python 智能体框架（ReAct / Plan-and-Solve /
 | 数据库 schema | **v8**（代码里的最新迁移；老库在下次打开时自动升上来。迁移只增不改、逐条事务、幂等，见 `agentcode/storage/migrations.py`） |
 | 代码量 | `agentcode/` 约 1.4 万行 Python（其中 `workflow/` 约 1400 行）；77 个测试文件 |
 | 测试 | **935 项全部离线**（不打真实模型、不联网；其中 1 项"POSIX 权限位"只在 Linux 上跑；作业2 的工作流相关 62 项） |
-| 提交 | 3 次：导入项目1 源码（基座）→ Workflow MVP（作业2 的功能）→ 接续说明定稿 |
+| 提交 | 4 次：导入项目1 源码（基座）→ Workflow MVP（作业2 的功能）→ 接续说明定稿 → 修打包脚本的中文文件名处理 |
 | 远程状态 | 只保留 `main`；功能分支合并后即删 |
 
 ## 2. 模块地图（`agentcode/`）

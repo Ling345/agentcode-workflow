@@ -8,19 +8,22 @@
 
 ## 1. 这是什么项目
 
-AgentCode：一个可扩展的 Python 智能体框架（ReAct / Plan-and-Solve / Reflection / Coding），
-带一个只给结果的本地网页。**《软件工程》作业的方向是"测试生成 Agent"**
-（为源码生成 pytest 用例并真的跑通），但代码在按"能收费的产品"这条线往下推。
+AgentCode：一个可扩展的 Python 智能体框架（ReAct / Plan-and-Solve / Reflection / Coding +
+测试生成 Agent），带一个只给结果的本地网页。**本仓库是《软件工程》作业2 的交付仓库**
+（Homework 2 · Simple Workflow MVP）：在这个框架上加了一层"多智能体流程编排"，
+节点直接复用框架里已有的智能体。项目1（Homework 1 · 测试生成 Agent）的实现与文档
+整份带在这里（原设计文档见 `docs/design-homework1.md`，上游仓库是 myagent）。
 
 | 事实 | 值 |
 | --- | --- |
-| 仓库 | https://github.com/Ling345/myagent（`main` 是唯一长期分支） |
-| 本地路径 | `D:\agent\agentcode-homework1` |
+| 仓库 | https://github.com/Ling345/agentcode-workflow（`main` 是唯一长期分支） |
+| 上游（项目1） | https://github.com/Ling345/myagent（main @ 1a9f9ea 时导入） |
+| 本地路径 | `D:\软件工程\作业2` |
 | Python | `D:\Anaconda\python.exe`（3.13）；CI 还跑 3.10 / Windows 3.13 |
 | 数据库 schema | **v8**（代码里的最新迁移；老库在下次打开时自动升上来。迁移只增不改、逐条事务、幂等，见 `agentcode/storage/migrations.py`） |
-| 代码量 | `agentcode/` 约 1.2 万行 Python；70 个测试文件 |
-| 测试 | **873 项全部离线**（不打真实模型、不联网、不发行邮件；其中 1 项"POSIX 权限位"只在 Linux 上跑） |
-| 提交 | 88 次；PR #1–#17 已合并（#2 是重复提交，已关闭未合并） |
+| 代码量 | `agentcode/` 约 1.4 万行 Python（其中 `workflow/` 约 1400 行）；77 个测试文件 |
+| 测试 | **935 项全部离线**（不打真实模型、不联网；其中 1 项"POSIX 权限位"只在 Linux 上跑；作业2 的工作流相关 62 项） |
+| 提交 | 见 `git log`（本仓库从项目1 的源码起步，只有作业2 自己的提交） |
 | 远程状态 | 只保留 `main`；功能分支合并后即删 |
 
 ## 2. 模块地图（`agentcode/`）
@@ -45,8 +48,22 @@ AgentCode：一个可扩展的 Python 智能体框架（ReAct / Plan-and-Solve /
 | `web/runner.py` | 把一次 agent 运行变成事件流（status/step/answer/error），sync 与 async 共用 | 运行链路 |
 | `web/sessions.py` | 会话仓库（按账号分目录、磁盘持久化、回收站软删除） | 会话 |
 | `web/static/` | `index.html` / `app.js` / `style.css`（浅蓝流动背景、面板式侧栏） | 界面 |
+| `workflow/` | **作业2 的交付**：流程编排（定义/状态/引擎/内置流程/落盘/在线运行） | 改流程或加节点类型 |
+| `web/static/workflow.*` | 工作流可视化页面（流程图 + 实时状态 + 历史运行） | 改工作流界面 |
 
-## 3. 已完成（按 PR）
+## 3. 作业2 做了什么（这一版的内容）
+
+| 事 | 说明 |
+| --- | --- |
+| 流程引擎 | `agentcode/workflow/`：图（节点 + 带条件的连线）、波次执行、分支/循环/并行、重试与错误策略、三重防死循环上限 |
+| 共享状态 | `WorkflowState`：键值 + 写入历史 + `${变量}` 模板；并行写加锁 |
+| 三条内置流程 | `mini_se`（需求→设计→编码→汇总）、`test_pipeline`（生成测试→执行→没过回到生成）、`code_review`（编码→审查→需要就修复复审） |
+| 入口 | CLI `agentcode workflow list/show/run/runs/log`；网页 `/workflow`（SSE 实时状态） |
+| 记录 | 每次运行落盘 `traces/workflows/<run_id>.json`（原子写），可回看每个节点与共享状态 |
+| 复用 | 节点用项目1 的智能体注册表 + `run_stream`；命令节点用项目1 的代码执行后端（local/docker） |
+| 测试 | 62 项（引擎 18 / 状态 8 / 内置流程 11 / 落盘 6 / 在线 4 / CLI 8 / 网页 7） |
+
+## 3.1 项目1 的历史（按 PR，来自上游仓库）
 
 | PR | 内容 |
 | --- | --- |
@@ -87,7 +104,9 @@ AgentCode：一个可扩展的 Python 智能体框架（ReAct / Plan-and-Solve /
 
 | 事 | 为什么值得做 | 备注 |
 | --- | --- | --- |
-| 流式接口 | 网页有 SSE，对外没开 | 适合聊天式集成 |
+| 工作流的"人工审批/暂停恢复"节点 | 现在流程只能一口气跑完 | 真实业务里常要"等人点一下再继续" |
+| 并行分支的显式 join（等哪个/等几个） | 现在是"整波跑完才往下" | 需要"任一完成即继续"时要加 |
+| 审查结论结构化（要求模型输出 JSON） | 现在 `code_review` 靠关键词判断 | 真实场景更稳 |
 | 细分权限 | 现在一把令牌能调全部接口 | 例如只读令牌 |
 | 邮箱"点链接验证" | 现在只做格式校验，填错也存得下 | 需要稳定发信能力 |
 | 真支付接入 | 订单现在是人工确认（`billing confirm`） | 与定价策略相关，用户之前说先放一放 |
@@ -118,6 +137,11 @@ D:\Anaconda\python.exe -m agentcode token create <账号> --name CI --days 90
 D:\Anaconda\python.exe -m agentcode api list <账号>
 D:\Anaconda\python.exe -m agentcode api callbacks <账号>     # 回调投递到了哪一步
 D:\Anaconda\python.exe -m agentcode audit list --action-prefix api.
+D:\Anaconda\python.exe -m agentcode workflow list            # 内置流程
+D:\Anaconda\python.exe -m agentcode workflow show test_pipeline
+D:\Anaconda\python.exe -m agentcode workflow run test_pipeline --llm mock
+D:\Anaconda\python.exe -m agentcode workflow runs            # 最近的运行
+D:\Anaconda\python.exe -m agentcode workflow log <run_id>    # 某次运行的每个节点
 D:\Anaconda\python.exe -m agentcode trash list <账号>
 D:\Anaconda\python.exe -m agentcode notify list
 D:\Anaconda\python.exe -m agentcode backup create
@@ -149,6 +173,11 @@ launch_chrome_cdp.ps1 + verify_*.mjs（真浏览器验证）
   收方要按 `run_id` 幂等——`docs/api.md` 里写明了这一点。
 - **回调的审计只记主机名**：webhook 地址的密钥常藏在路径（Slack）或 query 里，
   完整地址只留在库里，不进审计、不进接口响应。
+- **工作流的"跳过"不要乱记**：回边的目标早跑过了，再记一条"跳过"只会把日志弄乱；
+  只给"从没跑过的支路"记跳过（见 `engine._plan_next`）。
+- **循环必须有三道上限**：`Edge.max_times`（这条边）、`Node.max_visits`（这个节点）、
+  `Workflow.max_steps`（整条流程）。少一道就可能转到天荒地老。
+- **流程里画了终点却没走到 = 失败**：这不只是"少走一步"，十有八九是某条分支没出口。
 
 ## 9. 这个项目的约定（别破坏）
 

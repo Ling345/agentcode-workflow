@@ -40,6 +40,7 @@ from agentcode.web.limits import (
     UsageGuard,
 )
 from agentcode.web.runs import RunRegistry
+from agentcode.workflow.live import LiveRuns
 from agentcode.tools import (
     ToolRegistry,
     register_builtin_tools,
@@ -1275,6 +1276,167 @@ class AgentCodeRequestHandler(BaseHTTPRequestHandler):
         store: AccountStore = self.server.accounts  # type: ignore[attr-defined]
         self._send_json({"runs": store.api_runs(account.id, limit=max(1, min(100, limit)))})
 
+    # ------------------------------------------------------------ Workflow
+
+    def _workflow_by_name(self, name: str):
+        """按名字取流程；取不到时已经回过 404，返回 ``None``。"""
+        from agentcode.core.errors import AgentCodeError
+        from agentcode.workflow.library import get_workflow
+
+        try:
+            return get_workflow(name)
+        except AgentCodeError as exc:
+            self._send_json({"error": str(exc)}, status=404)
+            return None
+
+    def _serve_workflows(self) -> None:
+        """GET /api/workflows：内置流程清单。"""
+        from agentcode.workflow.library import list_workflows
+
+        self._send_json({"workflows": list_workflows()})
+
+    def _serve_workflow_detail(self) -> None:
+        """GET /api/workflow?name=：某个流程的节点与连线（网页画图用）。"""
+        query = parse_qs(urlsplit(self.path).query)
+        name = (query.get("name") or [""])[0]
+        workflow = self._workflow_by_name(name)
+        if workflow is None:
+            return
+        self._send_json({"workflow": workflow.to_dict()})
+
+    def _serve_workflow_runs(self) -> None:
+        """GET /api/workflow/runs：最近跑过的流程（读的是落盘的记录）。"""
+        from agentcode.workflow.store import list_runs
+
+        query = parse_qs(urlsplit(self.path).query)
+        try:
+            limit = int((query.get("limit") or ["10"])[0])
+        except ValueError:
+            limit = 10
+        self._send_json(
+            {"runs": list_runs(settings=self._settings(), limit=max(1, min(50, limit)))}
+        )
+
+    def _serve_workflow_record(self) -> None:
+        """GET /api/workflow/record?run_id=：某次运行的完整记录。"""
+        from agentcode.workflow.store import load_run
+
+        query = parse_qs(urlsplit(self.path).query)
+        run_id = (query.get("run_id") or [""])[0]
+        record = load_run(run_id, settings=self._settings())
+        if record is None:
+            self._send_json({"error": f"没有这个运行记录：{run_id}"}, status=404)
+            return
+        self._send_json(record)
+
+    def _serve_workflow_stream(self) -> None:
+        """GET /api/workflow/stream?run_id=：把这次运行的事件实时流出去。"""
+        query = parse_qs(urlsplit(self.path).query)
+        run_id = (query.get("run_id") or [""])[0]
+        live = self.server.live_runs.get(run_id)  # type: ignore[attr-defined]
+        if live is None:
+            self._send_json(
+                {"error": "找不到这个运行，它可能已经结束很久、记录被回收了。"}, status=404
+            )
+            return
+        self._begin_sse()
+        try:
+            self._write_event({"type": "live", "data": live.summary()})
+            for event in self.server.live_runs.subscribe(live):  # type: ignore[attr-defined]
+                self._write_event(event)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            self._log_access(200)
+
+    def _start_workflow_run(self, payload: dict[str, Any]) -> None:
+        """POST /api/workflow/run：在后台跑一条流程，进度走 SSE。"""
+        from agentcode import audit as AUDIT
+        from agentcode.audit import AuditLog
+        from agentcode.workflow.runners import default_agent_runner, default_command_runner
+
+        name = str(payload.get("name") or "").strip()
+        workflow = self._workflow_by_name(name)
+        if workflow is None:
+            return
+        inputs = payload.get("inputs")
+        if inputs is None:
+            inputs = {}
+        if not isinstance(inputs, dict):
+            self._send_json({"error": "inputs 必须是一个 JSON 对象。"}, status=400)
+            return
+        llm_mode = str(payload.get("llm") or getattr(self.server, "llm_mode", "mock"))
+        if llm_mode not in ("mock", "openai"):
+            self._send_json({"error": "llm 只支持 mock 或 openai。"}, status=400)
+            return
+
+        accounts: AccountStore = self.server.accounts  # type: ignore[attr-defined]
+        account = getattr(self, "_account", None)
+        if account is not None:
+            allowed, reason = accounts.check_quota(account)
+            if not allowed:
+                REJECTIONS.inc(reason="quota")
+                self._notify_quota(account)
+                self._send_json({"error": reason}, status=402)
+                return
+        plan = accounts.effective_plan(account) if account is not None else None
+        guard_key = f"workflow:{account.id if account is not None else 'anonymous'}"
+        decision = self.server.guard.acquire(  # type: ignore[attr-defined]
+            guard_key,
+            per_minute=plan.per_minute if plan is not None else DEFAULT_PER_MINUTE,
+            max_concurrent=plan.max_concurrent if plan is not None else DEFAULT_MAX_CONCURRENT,
+        )
+        if not decision.allowed:
+            self._reject_by_limit(decision)
+            return
+
+        settings = self._settings()
+
+        def on_finished(record) -> None:
+            """流程跑完：放掉并发名额、把用量记进同一本账、留一条审计。"""
+            self.server.guard.release(guard_key)  # type: ignore[attr-defined]
+            if record is None:
+                return
+            if account is not None:
+                tokens = sum(
+                    int((item.usage or {}).get("total_tokens") or 0) for item in record.nodes
+                )
+                calls = sum(1 for item in record.nodes if item.usage)
+                if tokens or calls:
+                    accounts.record_usage(account.id, tokens, calls=calls, run_id=record.run_id)
+            AuditLog(accounts).record(
+                AUDIT.WORKFLOW_RUN,
+                account=account,
+                target=record.workflow,
+                result=record.status,
+                detail={
+                    "run_id": record.run_id,
+                    "steps": record.executed_steps(),
+                    "ms": round(record.duration_ms),
+                    "llm": llm_mode,
+                },
+            )
+
+        live = self.server.live_runs.start(  # type: ignore[attr-defined]
+            workflow,
+            inputs,
+            settings=settings,
+            llm_mode=llm_mode,
+            agent_runner=default_agent_runner(settings=settings, llm_mode=llm_mode),
+            command_runner=default_command_runner(settings=settings),
+            on_finished=on_finished,
+        )
+        self._send_json(
+            {
+                "run_id": live.run_id,
+                "workflow": workflow.name,
+                "title": workflow.title,
+                "status": "running",
+                "stream": f"/api/workflow/stream?run_id={live.run_id}",
+            },
+            status=202,
+        )
+
     def _may_access_run(self, record: Any) -> bool:
         """登录模式下只能看自己的运行；免登录模式不设限。"""
         if not getattr(self.server, "require_auth", True):
@@ -1400,6 +1562,10 @@ class AgentCodeRequestHandler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             self._serve_static("index.html")
             return
+        # 工作流页面与首页一样先给静态页面，数据接口再走登录校验
+        if path in ("/workflow", "/workflow.html"):
+            self._serve_static("workflow.html")
+            return
         if path.startswith("/static/"):
             self._serve_static(path[len("/static/") :])
             return
@@ -1481,6 +1647,21 @@ class AgentCodeRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/tokens":
             self._serve_tokens()
+            return
+        if path == "/api/workflows":
+            self._serve_workflows()
+            return
+        if path == "/api/workflow":
+            self._serve_workflow_detail()
+            return
+        if path == "/api/workflow/runs":
+            self._serve_workflow_runs()
+            return
+        if path == "/api/workflow/record":
+            self._serve_workflow_record()
+            return
+        if path == "/api/workflow/stream":
+            self._serve_workflow_stream()
             return
         if path == "/v1/me":
             self._serve_api_me()
@@ -1575,6 +1756,7 @@ class AgentCodeRequestHandler(BaseHTTPRequestHandler):
             "/v1/run",
             "/api/tokens/create",
             "/api/tokens/revoke",
+            "/api/workflow/run",
         ):
             self._drain_body()
             self._send_json({"error": f"未找到路径 {path}。"}, status=404)
@@ -1600,6 +1782,15 @@ class AgentCodeRequestHandler(BaseHTTPRequestHandler):
             if payload is None:
                 return
             self._serve_api_run(payload)
+            return
+
+        if path == "/api/workflow/run":
+            payload = self._read_json()
+            if payload is None:
+                return
+            if not self._auth_ok():
+                return
+            self._start_workflow_run(payload)
             return
 
         if path == "/api/logout":
@@ -1901,6 +2092,8 @@ def create_server(
     server.login_guard = UsageGuard(per_minute=10, max_concurrent=50)  # type: ignore[attr-defined]
     #: 运行注册表：让任务的生命周期独立于浏览器的连接（刷新/断网都能续上）
     server.registry = RunRegistry()  # type: ignore[attr-defined]
+    #: 工作流的在线运行（网页"边跑边看"用；跑完的记录仍然落在磁盘上）
+    server.live_runs = LiveRuns()  # type: ignore[attr-defined]
     base_dir = Path(session_dir or default_session_dir())
     server.session_base_dir = base_dir  # type: ignore[attr-defined]
     server.max_sessions = max_sessions  # type: ignore[attr-defined]

@@ -1398,3 +1398,238 @@ button:disabled {
   padding: 4px 0;
   border-top: 1px solid rgba(63, 92, 240, 0.08);
 }
+
+/* ------------------------------------------------- 工作流页面（作业2 MVP）
+   和对话页共用同一套底色/面板风格：左选流程、中间看流程图并运行、右边回看历史。 */
+
+.wf-body {
+  overflow: auto;
+}
+
+.wf-page {
+  position: relative;
+  z-index: 1;
+  min-height: 100vh;
+  padding: 28px clamp(16px, 4vw, 44px) 48px;
+}
+
+.wf-page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.wf-page-head h1 {
+  margin: 0 0 6px;
+  font-size: 26px;
+}
+
+.wf-sub {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+.wf-back {
+  color: var(--accent);
+  font-size: 14px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.wf-back:hover {
+  text-decoration: underline;
+}
+
+.wf-layout {
+  display: grid;
+  grid-template-columns: 236px minmax(0, 1fr) 264px;
+  gap: 16px;
+  margin-top: 20px;
+  align-items: start;
+}
+
+.wf-column {
+  padding: 14px 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  backdrop-filter: blur(10px);
+}
+
+.wf-flows,
+.wf-run-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.wf-flow,
+.wf-run {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.wf-flow span,
+.wf-run span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.wf-flow:hover,
+.wf-run:hover {
+  border-color: var(--accent-line);
+}
+
+.wf-flow.is-active,
+.wf-run.is-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.wf-head h2 {
+  margin: 0 0 4px;
+  font-size: 20px;
+}
+
+.wf-agents {
+  margin: 6px 0 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.wf-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 16px 0 4px;
+}
+
+.wf-form label {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.wf-form textarea {
+  padding: 8px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface-strong);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  resize: vertical;
+}
+
+.wf-form-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+}
+
+.wf-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.wf-form-row .primary {
+  margin-left: auto;
+}
+
+.wf-nodes {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 18px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.wf-node {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-strong);
+}
+
+.wf-node[data-status="running"] {
+  border-color: var(--accent);
+}
+
+.wf-node[data-status="ok"] {
+  border-color: rgba(23, 143, 90, 0.45);
+}
+
+.wf-node[data-status="failed"] {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.wf-node[data-status="skipped"] {
+  border-style: dashed;
+  opacity: 0.65;
+}
+
+.wf-node-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.wf-kind {
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.wf-badge {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.wf-node[data-status="ok"] .wf-badge {
+  color: #178f5a;
+}
+
+.wf-node[data-status="failed"] .wf-badge {
+  color: var(--danger);
+}
+
+.wf-node-detail {
+  margin: 6px 0 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.wf-edges {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+@media (max-width: 1080px) {
+  .wf-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

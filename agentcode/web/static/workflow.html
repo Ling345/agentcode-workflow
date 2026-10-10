@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AgentCode 工作流</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body class="wf-body">
+    <div class="flow" aria-hidden="true">
+      <span class="blob blob-a"></span>
+      <span class="blob blob-b"></span>
+      <span class="blob blob-c"></span>
+    </div>
+
+    <main class="wf-page">
+      <header class="wf-page-head">
+        <div>
+          <h1>工作流</h1>
+          <p class="wf-sub">
+            多个智能体按一张流程图协作：上游节点的产出写进共享状态，下游节点用
+            <code>${变量}</code> 取用。连线上的条件决定走哪条分支，指回前面的连线就是循环。
+          </p>
+        </div>
+        <a class="wf-back" href="/">← 回到对话</a>
+      </header>
+
+      <div class="wf-layout">
+        <aside class="wf-column wf-column-flows">
+          <p class="sidebar-label">内置流程</p>
+          <div id="wf-flows" class="wf-flows"></div>
+        </aside>
+
+        <section class="wf-column wf-column-main">
+          <header class="wf-head">
+            <h2 id="wf-title">正在加载…</h2>
+            <p id="wf-desc" class="wf-sub"></p>
+            <p id="wf-agents" class="wf-agents"></p>
+          </header>
+
+          <form id="wf-form" class="wf-form">
+            <label for="wf-input">流程输入（每行一个 <code>键=值</code>）</label>
+            <textarea
+              id="wf-input"
+              rows="2"
+              spellcheck="false"
+              placeholder="request=写一个计算器"
+            ></textarea>
+            <div class="wf-form-row">
+              <label class="wf-radio">
+                <input type="radio" name="wf-llm" value="mock" checked />
+                离线演示（mock，不花钱）
+              </label>
+              <label class="wf-radio">
+                <input type="radio" name="wf-llm" value="openai" />
+                真实模型（openai）
+              </label>
+              <button type="submit" class="primary" id="wf-run">运行这条流程</button>
+            </div>
+            <p class="composer-hint" id="wf-status" role="status" aria-live="polite"></p>
+          </form>
+
+          <ol class="wf-nodes" id="wf-nodes"></ol>
+        </section>
+
+        <aside class="wf-column wf-column-runs">
+          <p class="sidebar-label">最近的运行</p>
+          <div id="wf-run-list" class="wf-run-list"></div>
+        </aside>
+      </div>
+    </main>
+
+    <script src="/static/workflow.js"></script>
+  </body>
+</html>

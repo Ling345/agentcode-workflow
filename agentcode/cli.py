@@ -287,6 +287,39 @@ def build_parser() -> argparse.ArgumentParser:
     api_callbacks.add_argument("--limit", type=int, default=20, help="看多少条，默认 20")
     api_callbacks.add_argument("--json", action="store_true", help="以 JSON 输出")
 
+    workflow_parser = subparsers.add_parser(
+        "workflow", help="多智能体流程编排：节点直接复用已注册的智能体"
+    )
+    workflow_sub = workflow_parser.add_subparsers(dest="workflow_command", required=True)
+    workflow_list = workflow_sub.add_parser("list", help="列出内置流程")
+    workflow_list.add_argument("--json", action="store_true", help="以 JSON 输出")
+    workflow_show = workflow_sub.add_parser("show", help="看某个流程的节点与连线")
+    workflow_show.add_argument("name", help="流程名，例如 mini_se")
+    workflow_show.add_argument("--json", action="store_true", help="以 JSON 输出")
+    workflow_run = workflow_sub.add_parser("run", help="跑一次流程")
+    workflow_run.add_argument("name", help="流程名，例如 test_pipeline")
+    workflow_run.add_argument(
+        "--input",
+        action="append",
+        default=[],
+        metavar="键=值",
+        help="流程输入，可以写多次，例如 --input request=写一个计算器",
+    )
+    workflow_run.add_argument(
+        "--llm",
+        choices=["mock", "openai"],
+        default="mock",
+        help="模型模式：mock（默认，离线演示）或 openai（真实模型）",
+    )
+    workflow_run.add_argument("--label", default="", help="给这次运行起个名字，方便回看")
+    workflow_run.add_argument("--json", action="store_true", help="以 JSON 输出运行记录")
+    workflow_runs = workflow_sub.add_parser("runs", help="看最近的运行记录")
+    workflow_runs.add_argument("--limit", type=int, default=10, help="看多少条，默认 10")
+    workflow_runs.add_argument("--json", action="store_true", help="以 JSON 输出")
+    workflow_log = workflow_sub.add_parser("log", help="看某次运行的完整过程")
+    workflow_log.add_argument("run_id", help="运行编号（用 workflow runs 查）")
+    workflow_log.add_argument("--json", action="store_true", help="以 JSON 输出")
+
     trash_parser = subparsers.add_parser("trash", help="回收站：误删的东西在这里")
     trash_sub = trash_parser.add_subparsers(dest="trash_command", required=True)
     trash_list = trash_sub.add_parser("list", help="看某个账号的回收站")
@@ -799,6 +832,232 @@ def _api_callbacks(store: Any, account: Any, args: argparse.Namespace) -> int:
             print(f"      最后错误：{item['callback_error']}")
     print("  重试：网络错误/5xx/429 按退避重试，最多 AGENT_CALLBACK_MAX_ATTEMPTS 次；4xx 直接放弃")
     return 0
+
+
+_WORKFLOW_STATUS_MARK = {
+    "succeeded": "成功",
+    "partial": "部分完成",
+    "failed": "失败",
+    "running": "跑着",
+}
+
+
+def _workflow_command(args: argparse.Namespace) -> int:
+    """Workflow 子命令：看流程、跑流程、回看运行记录。
+
+    默认 ``--llm mock``：离线演示不需要密钥、不花钱，评阅时 clone 下来就能跑。
+    想用真实模型加 ``--llm openai``。
+    """
+    from agentcode.core.errors import AgentCodeError
+    from agentcode.workflow import WorkflowEngine
+    from agentcode.workflow.library import get_workflow, list_workflows
+    from agentcode.workflow.store import list_runs, load_run, save_run
+
+    command = args.workflow_command
+    if command == "list":
+        flows = list_workflows()
+        if args.json:
+            print(json.dumps({"workflows": flows}, ensure_ascii=False))
+            return 0
+        print(f"内置流程 {len(flows)} 个（节点直接复用已注册的智能体）：")
+        for item in flows:
+            print(f"  {item['name']:<14} {item['title']}")
+            print(f"      {'；'.join(item['tags']) or '—'}｜节点 {item['nodes']} 个")
+            print(f"      智能体：{'、'.join(item['agents'])}")
+        print("  看细节：agentcode workflow show <流程名>")
+        print('  跑一次：agentcode workflow run mini_se --input request="写一个计算器"')
+        return 0
+
+    if command == "show":
+        try:
+            workflow = get_workflow(args.name)
+        except AgentCodeError as exc:
+            print(f"错误：{exc}")
+            return 2
+        payload = workflow.to_dict()
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+            return 0
+        print(_format_workflow(payload))
+        return 0
+
+    if command == "run":
+        try:
+            workflow = get_workflow(args.name)
+        except AgentCodeError as exc:
+            print(f"错误：{exc}")
+            return 2
+        inputs: dict[str, Any] = {}
+        for item in args.input:
+            if "=" not in str(item):
+                print(f"错误：--input 要写成 键=值，收到的是：{item}")
+                return 2
+            key, value = str(item).split("=", 1)
+            inputs[key.strip()] = value
+        settings = _load_settings(args)
+        mode_note = (
+            "离线演示（mock，脚本假数据）"
+            if args.llm == "mock"
+            else "真实模型（openai）"
+        )
+        if not args.json:
+            print(f"流程：{workflow.title}（{workflow.name}）")
+            print(f"模型：{mode_note}")
+            print(f"输入：{_format_inputs(inputs)}")
+
+        def on_event(event: dict) -> None:
+            if args.json or event.get("type") != "node":
+                return
+            data = event.get("data") or {}
+            name = data.get("title") or data.get("name") or ""
+            status = data.get("status")
+            if status == "running":
+                print(f"  正在跑：{name}…")
+            elif status == "ok":
+                print(f"  [ok] {name}（{data.get('duration_ms', 0):.0f} ms）")
+            elif status == "failed":
+                print(f"  [失败] {name}：{data.get('error', '')}")
+            elif status == "skipped":
+                print(f"  [跳过] {name}：{data.get('skipped_reason', '')}")
+
+        engine = WorkflowEngine(
+            workflow,
+            settings=settings,
+            llm_mode=args.llm,
+            on_event=on_event,
+        )
+        run = engine.run(inputs)
+        if args.json:
+            saved = save_run(run, settings=settings, label=args.label)
+            payload = run.to_dict()
+            payload["record_path"] = str(saved)
+            print(json.dumps(payload, ensure_ascii=False))
+            return 0 if run.status != "failed" else 1
+
+        print(
+            f"结果：{_WORKFLOW_STATUS_MARK.get(run.status, run.status)}"
+            f"（{run.executed_steps()} 步，{run.duration_ms:.0f} ms）"
+        )
+        if run.error:
+            print(f"原因：{run.error}")
+        print(f"共享状态：{'、'.join(run.state) or '（空）'}")
+        path = save_run(run, settings=settings, label=args.label)
+        print(f"运行记录：{path}")
+        return 0 if run.status != "failed" else 1
+
+    if command == "runs":
+        settings = _load_settings(args)
+        records = list_runs(settings=settings, limit=max(1, int(args.limit)))
+        if args.json:
+            print(json.dumps({"runs": records}, ensure_ascii=False))
+            return 0
+        if not records:
+            print("还没有跑过任何流程。试试：agentcode workflow run mini_se --input request=你好")
+            return 0
+        print(f"最近 {len(records)} 次运行：")
+        for item in records:
+            mark = _WORKFLOW_STATUS_MARK.get(str(item["status"]), str(item["status"]))
+            label = f"  「{item['label']}」" if item.get("label") else ""
+            print(
+                f"  {item['started_at']}  {item['run_id']}  {item['workflow']:<14}"
+                f" {mark}  {item['steps']} 步  {item['duration_ms']:.0f} ms{label}"
+            )
+        print("  看某次的细节：agentcode workflow log <run_id>")
+        return 0
+
+    if command == "log":
+        settings = _load_settings(args)
+        record = load_run(args.run_id, settings=settings)
+        if record is None:
+            print(f"错误：没有这个运行记录：{args.run_id}")
+            return 2
+        if args.json:
+            print(json.dumps(record, ensure_ascii=False))
+            return 0
+        print(_format_run_log(record))
+        return 0
+
+    print(f"错误：不认识的 workflow 子命令：{command}")
+    return 2
+
+
+def _format_inputs(inputs: dict[str, Any]) -> str:
+    if not inputs:
+        return "（无）"
+    return "，".join(f"{key}={value}" for key, value in inputs.items())
+
+
+def _format_workflow(payload: dict[str, Any]) -> str:
+    """把流程画成一张"文字流程图"，连线带上条件标签。"""
+    lines = [f"流程：{payload['title']}（{payload['name']}）"]
+    if payload["description"]:
+        lines.append(f"说明：{payload['description']}")
+    if payload["tags"]:
+        lines.append(f"标签：{'、'.join(payload['tags'])}")
+    lines.append(f"起点：{payload['start']}    步数上限：{payload['max_steps']}")
+    lines.append(f"节点 {len(payload['nodes'])} 个：")
+    for node in payload["nodes"]:
+        kind = {
+            "agent": "智能体",
+            "command": "命令",
+            "judge": "判定",
+            "end": "终点",
+        }.get(node["kind"], node["kind"])
+        who = f"  ← {node['agent']}" if node.get("agent") else ""
+        lines.append(f"  [{kind}] {node['name']:<12} {node['title']}{who}")
+        for edge in node["edges"]:
+            limit = f"（最多走 {edge['max_times']} 次）" if edge.get("max_times") else ""
+            lines.append(f"        └─ {edge['label']} → {edge['target']}{limit}")
+    lines.append("智能体：" + "、".join(payload["agents"]))
+    return "\n".join(lines)
+
+
+def _format_run_log(record: dict[str, Any]) -> str:
+    """把一次运行的过程打印成人能读的样子。"""
+    lines = [
+        f"运行 {record.get('run_id', '')}  流程 {record.get('workflow', '')}"
+        f"（{record.get('title', '')}）",
+        f"状态：{_WORKFLOW_STATUS_MARK.get(str(record.get('status')), record.get('status'))}"
+        f"    耗时：{float(record.get('duration_ms') or 0):.0f} ms"
+        f"    步数：{record.get('steps', 0)}",
+        f"输入：{_format_inputs(dict(record.get('inputs') or {}))}",
+    ]
+    if record.get("error"):
+        lines.append(f"原因：{record['error']}")
+    lines.append("节点过程：")
+    for item in record.get("nodes") or []:
+        kind = {
+            "agent": "智能体",
+            "command": "命令",
+            "judge": "判定",
+            "end": "终点",
+        }.get(item.get("kind"), item.get("kind"))
+        status = {
+            "ok": "ok",
+            "failed": "失败",
+            "skipped": "跳过",
+            "running": "跑着",
+        }.get(str(item.get("status")), str(item.get("status")))
+        head = (
+            f"  [{status}] {item.get('title', item.get('name'))}"
+            f"（{item.get('name')} / {kind}）"
+            f"  {float(item.get('duration_ms') or 0):.0f} ms"
+        )
+        if item.get("attempt", 1) > 1:
+            head += f"  尝试 {item['attempt']} 次"
+        lines.append(head)
+        if item.get("skipped_reason"):
+            lines.append(f"        跳过原因：{item['skipped_reason']}")
+        if item.get("error"):
+            lines.append(f"        错误：{item['error']}")
+        answer = str(item.get("answer") or "").strip().replace("\n", " ")
+        if answer:
+            lines.append(f"        产出 → {item.get('output_key')}：{_preview(answer, 60)}")
+    lines.append("共享状态（最后的快照）：")
+    for key, value in (record.get("state") or {}).items():
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+        lines.append(f"  {key} = {_preview(str(text).replace(chr(10), ' '), 80)}")
+    return "\n".join(lines)
 
 
 def _run_command(args: argparse.Namespace) -> int:
@@ -1598,6 +1857,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.command == "api":
             return _api_command(args)
+
+        if args.command == "workflow":
+            return _workflow_command(args)
 
         if args.command == "test-gen":
             return _testgen_command(args)

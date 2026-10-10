@@ -1,10 +1,16 @@
 # AgentCode：可扩展的 Python 智能体框架
 
-[![CI](https://github.com/Ling345/myagent/actions/workflows/ci.yml/badge.svg)](https://github.com/Ling345/myagent/actions/workflows/ci.yml)
+[![CI](https://github.com/Ling345/agentcode-workflow/actions/workflows/ci.yml/badge.svg)](https://github.com/Ling345/agentcode-workflow/actions/workflows/ci.yml)
 
-> **软件工程 · Homework 1（Code Agent）**：本项目的作业方向是**测试生成 Agent**——
-> 为指定源码生成 pytest 用例，并**真的跑通**（生成 → 运行 → 读报错 → 修正 → 全绿）。
-> 设计说明与评分点对照见 [Design.md](Design.md)。
+> **软件工程 · Homework 2（Simple Workflow MVP）**：这个仓库交付的是**多智能体工作流**——
+> 一条流程就是一张图（节点 + 带条件的连线），节点**直接复用**项目1 里写的智能体，
+> 支持顺序、条件分支、循环、并行、重试与执行记录，另带一个网页可视化界面。
+> 设计说明与评分点对照见 [Design.md](Design.md)，使用与扩展手册见
+> [`docs/workflow.md`](docs/workflow.md)。
+>
+> 项目1（Homework 1 · 测试生成 Agent）的实现与文档整份带在本仓库里，
+> 原设计文档留档于 [`docs/design-homework1.md`](docs/design-homework1.md)；
+> 上游仓库：<https://github.com/Ling345/myagent>。
 
 一个把「智能体范式」做成可插拔组件的教学向框架：LLM 后端、工具、记忆、中间件都能替换，
 新增一个智能体只需要**一个文件**加一个注册装饰器；附带一个本地网页，只给结果，但记住你们的对话。
@@ -51,6 +57,9 @@
 >
 > 阶段十三进行中：**对外开放 API**（API 令牌 + `POST /v1/run` / `GET /v1/me`，
 > 让脚本和 CI 也能用，用量记进同一本账）。详见 [`docs/api.md`](docs/api.md)。
+>
+> 阶段十四（本次作业）：**多智能体工作流**（节点 = 项目1 的智能体，
+> 条件/循环/并行、执行记录、网页可视化）。详见下面「Workflow MVP」一节。
 
 内置四种智能体：
 
@@ -58,6 +67,42 @@
 - **Plan-and-Solve**：先拆解计划，再逐步执行，适合多步骤推理题。
 - **Reflection**：生成 → 评审 → 优化，适合代码与写作类任务。
 - **Coding**：写测试 → 写实现 → 跑测试 → 改到全绿，反馈来自真实运行结果。
+
+## Workflow MVP（本次作业的交付）
+
+作业2 要做的是"2-3 个 Agent 协作的最小 Workflow"。这里把它做成框架的一个子系统：
+**一条流程 = 一张图**，节点直接复用上面的智能体（`react` / `plan_and_solve` /
+`coding` / `test_gen` / `echo`），以及项目1 的代码执行后端——不重复造 Agent。
+
+```powershell
+# 有哪些流程
+D:\Anaconda\python.exe -m agentcode workflow list
+# 看某条流程的节点与连线（连线上的条件就是分支与循环）
+D:\Anaconda\python.exe -m agentcode workflow show test_pipeline
+# 离线跑一遍：不需要密钥、不花钱——生成测试 → 真的执行 pytest → 没过就回到生成
+D:\Anaconda\python.exe -m agentcode workflow run test_pipeline --llm mock
+# 换真实模型
+D:\Anaconda\python.exe -m agentcode workflow run mini_se --input request="写一个计算器" --llm openai
+# 回看跑过什么
+D:\Anaconda\python.exe -m agentcode workflow runs
+D:\Anaconda\python.exe -m agentcode workflow log <run_id>
+```
+
+网页版在 `/workflow`（`agentcode open` 之后点侧栏的「工作流」）：左边选流程，中间是流程图，
+跑起来每个节点实时变色，右边是历史运行，点一条就能看到当时的节点状态与共享状态快照。
+
+三条内置流程覆盖三种形态：
+
+| 流程 | 形态 | 用到的 Agent |
+| --- | --- | --- |
+| `mini_se` | 需求 → 设计 → 编码 → 汇总（顺序） | plan_and_solve、react、coding、echo |
+| `test_pipeline` | 生成测试 → 执行 → **没过就回到生成**（条件 + 循环） | test_gen、echo + 命令/判定节点 |
+| `code_review` | 编码 → 审查 → **需修改就修复并复审**（条件 + 循环） | coding、react、echo |
+
+加一条自己的流程只要写几个 `Node` / `Edge` 再 `register_workflow`，不用动引擎；
+把节点换给别的智能体只改 `agent=` 一个字段。两种模式的区别：`--llm mock` 用项目1 的
+离线脚本模型（`test_pipeline` 会真的写文件、真的跑 pytest；`mini_se` / `code_review` 的
+**内容是演示假数据**），`--llm openai` 才走真实模型。
 
 ## 快速开始
 

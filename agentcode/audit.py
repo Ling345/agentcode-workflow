@@ -49,6 +49,8 @@ API_RUN = "api.run"
 API_CALLBACK = "api.callback"
 API_TOKEN_CREATE = "api_token.create"
 API_TOKEN_REVOKE = "api_token.revoke"
+#: Workflow（多智能体流程编排）
+WORKFLOW_RUN = "workflow.run"
 #: 运维动作
 BACKUP_CREATE = "backup.create"
 BACKUP_RESTORE = "backup.restore"

@@ -74,21 +74,25 @@
 **一条流程 = 一张图**，节点直接复用上面的智能体（`react` / `plan_and_solve` /
 `coding` / `test_gen` / `echo`），以及项目1 的代码执行后端——不重复造 Agent。
 
+> 命令里的 `python` 指你自己机器上的 Python 解释器（3.10 以上）。装好依赖
+> （`python -m pip install -r requirements.txt`）后按下面的命令跑就行；
+> 本文档里其它地方的 `D:\Anaconda\python.exe` 是本机的解释器路径，同样换成 `python` 即可。
+
 ```powershell
 # 有哪些流程
-D:\Anaconda\python.exe -m agentcode workflow list
+python -m agentcode workflow list
 # 看某条流程的节点与连线（连线上的条件就是分支与循环）
-D:\Anaconda\python.exe -m agentcode workflow show test_pipeline
+python -m agentcode workflow show test_pipeline
 # 离线跑一遍：不需要密钥、不花钱——生成测试 → 真的执行 pytest → 没过就回到生成
-D:\Anaconda\python.exe -m agentcode workflow run test_pipeline --llm mock
+python -m agentcode workflow run test_pipeline --llm mock
 # 换真实模型
-D:\Anaconda\python.exe -m agentcode workflow run mini_se --input request="写一个计算器" --llm openai
+python -m agentcode workflow run mini_se --input request="写一个计算器" --llm openai
 # 回看跑过什么
-D:\Anaconda\python.exe -m agentcode workflow runs
-D:\Anaconda\python.exe -m agentcode workflow log <run_id>
+python -m agentcode workflow runs
+python -m agentcode workflow log <run_id>
 ```
 
-网页版在 `/workflow`（`agentcode open` 之后点侧栏的「工作流」）：左边选流程，中间是流程图，
+网页版在 `/workflow`（`python -m agentcode open` 之后点侧栏的「工作流」）：左边选流程，中间是流程图，
 跑起来每个节点实时变色，右边是历史运行，点一条就能看到当时的节点状态与共享状态快照。
 
 三条内置流程覆盖三种形态：

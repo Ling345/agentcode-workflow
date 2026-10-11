@@ -208,20 +208,23 @@ JSON（见第 9 节限制）。
 
 ### 6.1 命令行
 
+> 下面的 `python` 指你自己机器上的解释器（3.10 以上）；先在仓库根目录执行
+> `python -m pip install -r requirements.txt` 装依赖。
+
 ```powershell
-D:\Anaconda\python.exe -m agentcode workflow list                     # 有哪些流程
-D:\Anaconda\python.exe -m agentcode workflow show test_pipeline       # 节点与连线（含条件标签）
+python -m agentcode workflow list                     # 有哪些流程
+python -m agentcode workflow show test_pipeline       # 节点与连线（含条件标签）
 
 # 离线演示：不需要密钥、不花钱（默认就是 mock）
-D:\Anaconda\python.exe -m agentcode workflow run test_pipeline --llm mock
-D:\Anaconda\python.exe -m agentcode workflow run mini_se --input request="写一个计算器" --llm mock
+python -m agentcode workflow run test_pipeline --llm mock
+python -m agentcode workflow run mini_se --input request="写一个计算器" --llm mock
 
 # 真实模型
-D:\Anaconda\python.exe -m agentcode workflow run mini_se --input request="写一个计算器" --llm openai
+python -m agentcode workflow run mini_se --input request="写一个计算器" --llm openai
 
 # 回看
-D:\Anaconda\python.exe -m agentcode workflow runs
-D:\Anaconda\python.exe -m agentcode workflow log <run_id>
+python -m agentcode workflow runs
+python -m agentcode workflow log <run_id>
 ```
 
 `workflow run` 的退出码：`0` = 成功（含 `partial`），`1` = 失败——可以直接放进 CI 当门禁。
@@ -229,8 +232,12 @@ D:\Anaconda\python.exe -m agentcode workflow log <run_id>
 ### 6.2 网页
 
 ```powershell
-D:\Anaconda\python.exe -m agentcode open     # 打开 http://127.0.0.1:8000/workflow
+python -m agentcode open     # 打开 http://127.0.0.1:8000/workflow
 ```
+
+第一次启动时账号库是空的，服务会自动建一个管理员账号并把密码**只打印一次**在控制台
+（形如 `已创建初始账号　用户名：admin　密码：xxxxxxxx`）。想自己开账号：
+`python -m agentcode user add 你的名字 --password 你的密码`。
 
 页面三栏：左边选流程；中间是流程图（每个节点一张卡，跑起来会实时变色，跳过的会标原因）；
 右边是最近运行，点一条即可回看当时的节点状态与共享状态快照。
@@ -287,7 +294,7 @@ register_workflow(Workflow(
 ### 8.1 自动化测试
 
 ```powershell
-D:\Anaconda\python.exe -m pytest -q          # 全量 935 项（含工作流 62 项）
+python -m pytest -q          # 全量 935 项（含工作流 62 项）
 ```
 
 | 测试文件 | 覆盖什么 |
